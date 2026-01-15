@@ -680,4 +680,4 @@ def main():
         
         save_value_outputs(
             value_model, targets, device,
-            out_path=f'./
+            out_path=f'./'
