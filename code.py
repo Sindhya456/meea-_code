@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 """
 Complete MCTS + UQ Pipeline for Lambda Labs
-Runs in 3 phases:
-1. Generate policy logits & value predictions (TTA)
-2. Generate UQ CSV files from the outputs
-3. Run MCTS + A* with UQ awareness
+Runs: Phase 1 (generate) → Phase 2 (UQ) → Phase 3 (MCTS/A* with UQ)
+
+Usage:
+  python run_pipeline.py --dataset USPTO --gpu 0 --phase all
+  python run_pipeline.py --dataset USPTO --gpu 0 --phase 1  # Just generate
+  python run_pipeline.py --dataset USPTO --gpu 0 --phase 2  # Just UQ
+  python run_pipeline.py --dataset USPTO --gpu 0 --phase 3  # Just search
 """
 
-import pickle
-import torch
-import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-import os
-import sys
-import argparse
-import time
-import signal
+import pickle, torch, torch.nn.functional as F, numpy as np, pandas as pd
+import os, sys, argparse, time, signal, heapq
 from contextlib import contextmanager
-from pathlib import Path
 
-# Import your custom modules
+# Your imports - make sure these files are in same directory
 from valueEnsemble import ValueEnsemble
 from policyNet import MLPModel
 from rdkit import Chem
 from rdkit.Chem import AllChem
-import heapq
+
+print("="*60)
+print("MCTS + UQ Pipeline for Lambda Labs")
+print("="*60)
 
 # ============================================================
-# UTILITIES
+# UTILITIES (Phase 0)
 # ============================================================
 
 class TimeoutException(Exception):
@@ -45,45 +42,21 @@ def time_limit(seconds):
     finally:
         signal.alarm(0)
 
-class SmilesEnumerator(object):
-    def __init__(self, charset='@C)(=cOn1S2/H[N]\\', pad=120,
-                 leftpad=True, isomericSmiles=True,
-                 enum=True, canonical=False):
-        self._charset = None
-        self.charset = charset
-        self.pad = pad
-        self.leftpad = leftpad
-        self.isomericSmiles = isomericSmiles
+class SmilesEnumerator:
+    def __init__(self, enum=True, canonical=False, isomericSmiles=True):
         self.enumerate = enum
         self.canonical = canonical
-
-    @property
-    def charset(self):
-        return self._charset
-
-    @charset.setter
-    def charset(self, charset):
-        self._charset = charset
-        self._charlen = len(charset)
-        self._char_to_int = dict((c, i) for i, c in enumerate(charset))
-        self._int_to_char = dict((i, c) for i, c in enumerate(charset))
-
+        self.isomericSmiles = isomericSmiles
+    
     def randomize_smiles(self, smiles):
         m = Chem.MolFromSmiles(smiles)
         if m is None:
-            raise ValueError(f"RDKit failed to parse SMILES: {smiles}")
+            return smiles
         ans = list(range(m.GetNumAtoms()))
         np.random.shuffle(ans)
         nm = Chem.RenumberAtoms(m, ans)
         return Chem.MolToSmiles(nm, canonical=self.canonical, 
                                isomericSmiles=self.isomericSmiles)
-
-def prepare_starting_molecules(path='./prepare_data/origin_dict.csv'):
-    if not os.path.exists(path):
-        print(f"[WARN] Starting molecules file not found: {path}")
-        return set()
-    df = pd.read_csv(path)
-    return set(df['mol'].astype(str).tolist()) if 'mol' in df.columns else set()
 
 def smiles_to_fp(s, fp_dim=2048):
     mol = Chem.MolFromSmiles(s)
@@ -100,20 +73,14 @@ def batch_smiles_to_fp(s_list, fp_dim=2048):
 def value_fn(model, mols, device):
     num_mols = len(mols)
     fps = batch_smiles_to_fp(mols).reshape(num_mols, -1)
-    index = len(fps)
-    if index <= 5:
-        mask = np.ones(5)
-        mask[index:] = 0
-        fps_input = np.zeros((5, 2048))
-        fps_input[:index] = fps
+    if len(fps) <= 5:
+        mask = np.ones(5); mask[len(fps):] = 0
+        fps_input = np.zeros((5, 2048)); fps_input[:len(fps)] = fps
     else:
-        mask = np.ones(index)
-        fps_input = fps
-
-    fps = torch.FloatTensor([fps_input]).to(device)
-    mask = torch.FloatTensor([mask]).to(device)
-    v = model(fps, mask).cpu().data.numpy()
-    return v[0][0]
+        mask = np.ones(len(fps)); fps_input = fps
+    fps_t = torch.FloatTensor([fps_input]).to(device)
+    mask_t = torch.FloatTensor([mask]).to(device)
+    return model(fps_t, mask_t).cpu().data.numpy()[0][0]
 
 def prepare_value(model_f, gpu):
     device = 'cpu' if gpu == -1 else f'cuda:{gpu}'
@@ -126,558 +93,365 @@ def prepare_expand(model_path, gpu):
     device = 'cpu' if gpu == -1 else f'cuda:{gpu}'
     return MLPModel(model_path, './saved_model/template_rules.dat', device=device)
 
+def prepare_starting_molecules():
+    path = './prepare_data/origin_dict.csv'
+    if not os.path.exists(path):
+        print(f"[WARN] {path} not found")
+        return set()
+    return set(pd.read_csv(path)['mol'].tolist())
+
 # ============================================================
-# PHASE 1: GENERATE POLICY LOGITS & VALUE PREDICTIONS
+# PHASE 1: GENERATE POLICY LOGITS & VALUE PREDS
 # ============================================================
 
-def _logmeanexp(a, axis=0):
-    m = np.max(a, axis=axis, keepdims=True)
-    return (m + np.log(np.exp(a - m).mean(axis=axis, keepdims=True))).squeeze(axis)
-
-def save_policy_outputs_tta(expand_fn, mols, device, out_path, 
-                            n_aug=20, aggregation="mean", topk=50, save_raw=True):
+def generate_policy_logits(expand_fn, mols, out_path, n_aug=20, topk=50):
     """Generate policy logits with TTA"""
-    print(f"\n[PHASE 1] Generating policy logits with TTA...")
-    print(f"  - Molecules: {len(mols)}")
-    print(f"  - Augmentations: {n_aug}")
-    print(f"  - Output: {out_path}")
+    print(f"\n[PHASE 1a] Generating policy logits...")
+    print(f"  Molecules: {len(mols)}, Augmentations: {n_aug}")
     
     sm_en = SmilesEnumerator(enum=True, canonical=False)
     results = []
-    raw_results = []
-
+    
     with torch.no_grad():
         for idx, s in enumerate(mols):
-            aug_candidates = []
-            aug_scores = []
-
+            aug_candidates, aug_scores = [], []
             for _ in range(n_aug):
                 try:
                     aug_s = sm_en.randomize_smiles(s)
-                except Exception:
+                except:
                     aug_s = s
-
                 out = expand_fn.run(aug_s, topk=topk)
                 if out is None:
-                    aug_candidates.append([])
-                    aug_scores.append(np.array([]))
-                    continue
-
-                aug_candidates.append(list(out['reactants']))
-                aug_scores.append(np.array(out['scores'], dtype=np.float32))
-
+                    aug_candidates.append([]); aug_scores.append(np.array([]))
+                else:
+                    aug_candidates.append(list(out['reactants']))
+                    aug_scores.append(np.array(out['scores'], dtype=np.float32))
+            
             union = []
             for cands in aug_candidates:
                 for c in cands:
-                    if c not in union:
-                        union.append(c)
-
-            if len(union) == 0:
-                continue
-
+                    if c not in union: union.append(c)
+            if not union: continue
+            
             aligned = np.zeros((n_aug, len(union)), dtype=np.float32)
             for i, (cands, scores) in enumerate(zip(aug_candidates, aug_scores)):
                 for j, c in enumerate(cands):
                     aligned[i, union.index(c)] = scores[j]
-
-            if aggregation == "mean":
-                agg_scores = aligned.mean(axis=0)
-            else:
-                log_aligned = np.log(np.clip(aligned, 1e-12, 1.0))
-                agg_scores = np.exp(_logmeanexp(log_aligned, axis=0))
-
-            results.append({
-                "mol": s,
-                "candidates": union,
-                "agg_scores": agg_scores
-            })
-
-            if save_raw:
-                raw_results.append({
-                    "mol": s,
-                    "union_candidates": union,
-                    "aligned_scores": aligned
-                })
-
-            if (idx + 1) % 10 == 0:
-                print(f"  Progress: {idx+1}/{len(mols)} ({100*(idx+1)/len(mols):.1f}%)")
-
+            
+            agg_scores = aligned.mean(axis=0)
+            results.append({"mol": s, "candidates": union, "agg_scores": agg_scores})
+            
+            if (idx+1) % 10 == 0:
+                print(f"  {idx+1}/{len(mols)} ({100*(idx+1)/len(mols):.1f}%)")
+    
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     np.save(out_path, np.array(results, dtype=object))
-    if save_raw:
-        np.save(out_path.replace(".npy", "_raw.npy"), np.array(raw_results, dtype=object))
-    
-    print(f"✅ Saved policy logits to {out_path}")
+    print(f"✅ Saved to {out_path}")
 
-def save_value_outputs(value_model, mols, device, out_path):
+def generate_value_preds(value_model, mols, device, out_path):
     """Generate value predictions"""
-    print(f"\n[PHASE 1] Generating value predictions...")
-    print(f"  - Molecules: {len(mols)}")
-    print(f"  - Output: {out_path}")
-    
+    print(f"\n[PHASE 1b] Generating value predictions...")
     preds = []
     for idx, s in enumerate(mols):
-        pred = value_fn(value_model, [s], device)
-        preds.append(pred)
-        if (idx + 1) % 10 == 0:
-            print(f"  Progress: {idx+1}/{len(mols)} ({100*(idx+1)/len(mols):.1f}%)")
-    
-    df = pd.DataFrame({"mol": mols, "value": preds})
-    df.to_csv(out_path, index=False)
-    print(f"✅ Saved value predictions to {out_path}")
+        preds.append(value_fn(value_model, [s], device))
+        if (idx+1) % 10 == 0:
+            print(f"  {idx+1}/{len(mols)} ({100*(idx+1)/len(mols):.1f}%)")
+    pd.DataFrame({"mol": mols, "value": preds}).to_csv(out_path, index=False)
+    print(f"✅ Saved to {out_path}")
 
 # ============================================================
 # PHASE 2: GENERATE UQ CSV FILES
 # ============================================================
 
-def compute_aleatoric_uncertainty(policy_logits_tta):
-    """Compute aleatoric uncertainty (predictive entropy)"""
-    probs = F.softmax(policy_logits_tta, dim=1)
-    mean_probs = probs.mean(dim=0)
-    entropy = -(mean_probs * torch.log(mean_probs + 1e-12)).sum().item()
-    return entropy, mean_probs
-
-def compute_epistemic_uncertainty_jsd(policy_logits, value_preds):
-    """Compute epistemic uncertainty via JSD"""
-    policy_probs = F.softmax(policy_logits, dim=1)
-    value_probs = torch.sigmoid(value_preds).squeeze(-1)
-    value_probs = torch.stack([value_probs, 1 - value_probs], dim=1)
-
-    if policy_probs.shape[1] != 2:
-        top2_probs, _ = torch.topk(policy_probs, 2, dim=1)
-        policy_probs = top2_probs / top2_probs.sum(dim=1, keepdim=True)
-
-    M = 0.5 * (policy_probs + value_probs)
-    jsd = 0.5 * (
-        (policy_probs * (torch.log(policy_probs + 1e-12) - torch.log(M + 1e-12))).sum(dim=1)
-        + (value_probs * (torch.log(value_probs + 1e-12) - torch.log(M + 1e-12))).sum(dim=1)
-    )
-    return jsd.cpu().numpy()
-
-def compute_combined_uq(aleatoric, epistemic, method="weighted_sum",
-                       alea_weight=0.5, epis_weight=0.5):
-    """Combine aleatoric + epistemic"""
-    aleatoric = np.asarray(aleatoric).ravel()
-    epistemic = np.asarray(epistemic).ravel()
-    if method == "weighted_sum":
-        combined = alea_weight * aleatoric + epis_weight * epistemic
-    elif method == "geometric_mean":
-        total = alea_weight + epis_weight
-        w_alea = alea_weight / total
-        w_epis = epis_weight / total
-        combined = np.power(aleatoric, w_alea) * np.power(epistemic, w_epis)
-    else:
-        raise ValueError(f"Unsupported combination method: {method}")
-    return combined.ravel()
-
-def uq_analysis(policy_logits, value_preds, alea_weight=0.5, epis_weight=0.5, 
-               method="weighted_sum"):
-    """Compute all UQ metrics"""
+def compute_uq(policy_logits, value_preds, alea_w=0.5, epis_w=0.5):
+    """Compute combined UQ scores"""
     B, C = policy_logits.shape
-
+    
+    # Aleatoric (entropy)
     aleatoric = []
     for i in range(B):
-        ent, _ = compute_aleatoric_uncertainty(policy_logits[i].unsqueeze(0))
-        aleatoric.append(ent)
+        probs = F.softmax(policy_logits[i].unsqueeze(0), dim=1)
+        mean_probs = probs.mean(dim=0)
+        entropy = -(mean_probs * torch.log(mean_probs + 1e-12)).sum().item()
+        aleatoric.append(entropy)
     aleatoric = np.array(aleatoric)
-
-    epistemic = compute_epistemic_uncertainty_jsd(policy_logits, value_preds)
-
-    uq_scores = compute_combined_uq(aleatoric, epistemic, method=method,
-                                   alea_weight=alea_weight, epis_weight=epis_weight)
-
-    return {
-        "aleatoric": aleatoric,
-        "epistemic": epistemic,
-        "combined": uq_scores
-    }
-
-def generate_uq_files(dataset, policy_logits_path, value_preds_path, save_dir="uq_outputs"):
-    """Generate UQ CSV files for different weight combinations"""
-    print(f"\n[PHASE 2] Generating UQ files...")
-    print(f"  - Policy logits: {policy_logits_path}")
-    print(f"  - Value preds: {value_preds_path}")
     
-    # Load data
-    policy_logits = np.load(policy_logits_path, allow_pickle=True)
-    value_df = pd.read_csv(value_preds_path)
+    # Epistemic (JSD)
+    policy_probs = F.softmax(policy_logits, dim=1)
+    value_probs = torch.sigmoid(value_preds).squeeze(-1)
+    value_probs = torch.stack([value_probs, 1-value_probs], dim=1)
+    if policy_probs.shape[1] != 2:
+        top2, _ = torch.topk(policy_probs, 2, dim=1)
+        policy_probs = top2 / top2.sum(dim=1, keepdim=True)
+    M = 0.5 * (policy_probs + value_probs)
+    jsd = 0.5 * ((policy_probs * (torch.log(policy_probs+1e-12) - torch.log(M+1e-12))).sum(dim=1)
+                 + (value_probs * (torch.log(value_probs+1e-12) - torch.log(M+1e-12))).sum(dim=1))
+    epistemic = jsd.cpu().numpy()
+    
+    # Combined
+    combined = alea_w * aleatoric + epis_w * epistemic
+    return combined
+
+def generate_uq_csvs(dataset):
+    """Generate UQ CSV files for different weight combinations"""
+    print(f"\n[PHASE 2] Generating UQ CSV files...")
+    
+    # Load outputs from Phase 1
+    policy_path = f'./test/policy_logits_tta_{dataset}.npy'
+    value_path = f'./test/value_preds_{dataset}.csv'
+    
+    policy_data = np.load(policy_path, allow_pickle=True)
+    value_df = pd.read_csv(value_path)
     
     # Convert to tensors
-    max_len = max(len(item['agg_scores']) for item in policy_logits)
+    max_len = max(len(item['agg_scores']) for item in policy_data)
     padded = []
-    for item in policy_logits:
+    for item in policy_data:
         scores = item['agg_scores']
-        pad_len = max_len - len(scores)
-        padded_scores = np.pad(scores, (0, pad_len), mode='constant')
+        padded_scores = np.pad(scores, (0, max_len-len(scores)), mode='constant')
         padded.append(padded_scores)
     
-    policy_logits_tensor = torch.tensor(np.array(padded), dtype=torch.float32)
-    value_preds_tensor = torch.tensor(value_df["value"].values, dtype=torch.float32)
+    policy_tensor = torch.tensor(np.array(padded), dtype=torch.float32)
+    value_tensor = torch.tensor(value_df["value"].values, dtype=torch.float32)
     
-    print(f"  - Policy logits shape: {policy_logits_tensor.shape}")
-    print(f"  - Value preds shape: {value_preds_tensor.shape}")
+    print(f"  Policy shape: {policy_tensor.shape}, Value shape: {value_tensor.shape}")
     
-    os.makedirs(save_dir, exist_ok=True)
-    weights = [(round(e, 1), round(1 - e, 1)) for e in np.linspace(0.1, 0.9, 9)]
+    # Generate CSVs for different weights
+    os.makedirs('uq_outputs', exist_ok=True)
+    weights = [(round(e,1), round(1-e,1)) for e in np.linspace(0.1, 0.9, 9)]
     
-    for epis_weight, alea_weight in weights:
-        result = uq_analysis(policy_logits_tensor, value_preds_tensor,
-                           alea_weight=alea_weight, epis_weight=epis_weight,
-                           method="weighted_sum")
-        
-        uq_scores = np.array(result["combined"]).ravel()
-        filename = f"uq_alea{alea_weight:.1f}_epis{epis_weight:.1f}.csv"
-        filepath = os.path.join(save_dir, filename)
+    for epis_w, alea_w in weights:
+        uq_scores = compute_uq(policy_tensor, value_tensor, alea_w, epis_w)
+        filename = f"uq_alea{alea_w:.1f}_epis{epis_w:.1f}.csv"
+        filepath = f'./uq_outputs/{filename}'
         pd.DataFrame({"uq_score": uq_scores}).to_csv(filepath, index=False)
-        print(f"  ✅ Saved: {filename}")
+        print(f"  ✅ {filename}")
     
-    print(f"✅ All UQ files generated in {save_dir}/")
+    print(f"✅ Generated 9 UQ CSV files")
 
 # ============================================================
-# PHASE 3: MCTS + A* WITH UQ
+# PHASE 3: MCTS WITH UQ
 # ============================================================
-
-def load_uncertainty_data(dataset, save_dir="uq_outputs", alea_weight=0.5, epis_weight=0.5):
-    """Load UQ scores from CSV"""
-    filename = f"uq_alea{alea_weight:.1f}_epis{epis_weight:.1f}.csv"
-    filepath = os.path.join(save_dir, filename)
-    
-    if not os.path.exists(filepath):
-        print(f"[WARN] UQ file not found: {filepath}, using zero uncertainty")
-        return {}
-    
-    df = pd.read_csv(filepath)
-    
-    # Load original dataset to get SMILES
-    dataset_path = f'./test_dataset/{dataset}.pkl'
-    with open(dataset_path, 'rb') as f:
-        targets = pickle.load(f)
-    
-    # Create dictionary mapping SMILES to UQ scores
-    uncertainty_dict = {}
-    for smiles, uq_score in zip(targets, df['uq_score'].values):
-        uncertainty_dict[smiles] = float(uq_score)
-    
-    print(f"[INFO] Loaded {len(uncertainty_dict)} uncertainty values from {filepath}")
-    return uncertainty_dict
 
 class MinMaxStats:
     def __init__(self):
         self.maximum = -float('inf')
         self.minimum = float('inf')
-
     def update(self, value):
         self.maximum = max(self.maximum, value)
         self.minimum = min(self.minimum, value)
-
     def normalize(self, value):
-        if self.maximum > self.minimum:
-            return (value - self.minimum) / (self.maximum - self.minimum)
-        return value
+        return (value - self.minimum) / (self.maximum - self.minimum) if self.maximum > self.minimum else value
 
 class Node:
-    def __init__(self, state, h, prior, cost=0, action_mol=None, fmove=0, 
-                 reaction=None, template=None, parent=None, cpuct=1.5, uncertainty=0.0):
-        self.state = state
-        self.h = h
-        self.prior = prior
-        self.cost = cost
-        self.uncertainty = uncertainty
-        self.action_mol = action_mol
-        self.fmove = fmove
-        self.reaction = reaction
-        self.template = template
-        self.parent = parent
-        self.cpuct = cpuct
-        self.children = []
-        self.visited_time = 0
-        self.is_expanded = False
-        self.child_illegal = np.array([])
-        self.f_mean_path = []
-
+    def __init__(self, state, h, prior, cost=0, action_mol=None, fmove=0, reaction=None,
+                 template=None, parent=None, cpuct=1.5, uncertainty=0.0):
+        self.state, self.h, self.prior, self.cost, self.uncertainty = state, h, prior, cost, uncertainty
+        self.action_mol, self.fmove, self.reaction, self.template, self.parent, self.cpuct = action_mol, fmove, reaction, template, parent, cpuct
+        self.children, self.visited_time, self.is_expanded, self.child_illegal, self.f_mean_path = [], 0, False, np.array([]), []
         if parent is None:
-            self.g = 0
-            self.depth = 0
+            self.g, self.depth = 0, 0
         else:
-            self.g = parent.g + cost
-            self.depth = parent.depth + 1
+            self.g, self.depth = parent.g + cost, parent.depth + 1
             parent.children.append(self)
-
         self.f = self.g + self.h
-
-    def child_N(self):
-        return np.array([child.visited_time for child in self.children])
-
-    def child_p(self):
-        return np.array([child.prior for child in self.children])
-
+    
+    def child_Q(self, stats):
+        return np.array([1 - np.mean(stats.normalize(c.f_mean_path)) if c.f_mean_path else 0.0 for c in self.children])
+    
     def child_U(self):
-        child_Ns = self.child_N() + 1
-        prior = self.child_p()
-        return self.cpuct * np.sqrt(self.visited_time) * prior / child_Ns
+        Ns = np.array([c.visited_time for c in self.children]) + 1
+        priors = np.array([c.prior for c in self.children])
+        return self.cpuct * np.sqrt(self.visited_time) * priors / Ns
+    
+    def select_child(self, stats, uq_weight=0.5):
+        score = self.child_Q(stats) + self.child_U()
+        uncertainties = np.array([c.uncertainty for c in self.children])
+        if len(uncertainties) > 0 and np.max(uncertainties) > 0:
+            score -= uq_weight * (uncertainties / np.max(uncertainties))
+        score -= self.child_illegal
+        return np.argmax(score)
 
-    def child_uncertainty(self):
-        return np.array([child.uncertainty for child in self.children])
-
-    def child_Q(self, min_max_stats):
-        child_Qs = []
-        for child in self.children:
-            if len(child.f_mean_path) == 0:
-                child_Qs.append(0.0)
-            else:
-                child_Qs.append(1 - np.mean(min_max_stats.normalize(child.f_mean_path)))
-        return np.array(child_Qs)
-
-    def select_child(self, min_max_stats, uncertainty_weight=0.5):
-        action_score = self.child_Q(min_max_stats) + self.child_U()
-        
-        child_uncertainties = self.child_uncertainty()
-        if len(child_uncertainties) > 0 and np.max(child_uncertainties) > 0:
-            normalized_uncertainty = child_uncertainties / np.max(child_uncertainties)
-            action_score -= uncertainty_weight * normalized_uncertainty
-        
-        action_score -= self.child_illegal
-        return np.argmax(action_score)
-
-class MCTS_A:
+class MCTS_UQ:
     def __init__(self, target_mol, known_mols, value_model, expand_fn, device,
-                 simulations, cpuct, uncertainty_dict=None, uncertainty_weight=0.5):
-        self.target_mol = target_mol
-        self.known_mols = known_mols
-        self.expand_fn = expand_fn
-        self.value_model = value_model
-        self.device = device
-        self.cpuct = cpuct
-        self.uncertainty_dict = uncertainty_dict if uncertainty_dict else {}
-        self.uncertainty_weight = uncertainty_weight
-
-        root_value = value_fn(value_model, [target_mol], device)
-        root_uncertainty = self.uncertainty_dict.get(target_mol, 0.0)
-
-        self.root = Node([target_mol], root_value, prior=1.0, cpuct=cpuct,
-                        uncertainty=root_uncertainty)
-        self.visited_policy = {}
-        self.visited_state = []
-        self.min_max_stats = MinMaxStats()
+                 simulations, cpuct, uq_dict, uq_weight):
+        self.target_mol, self.known_mols, self.value_model, self.expand_fn = target_mol, known_mols, value_model, expand_fn
+        self.device, self.cpuct, self.uq_dict, self.uq_weight = device, cpuct, uq_dict, uq_weight
+        self.visited_policy, self.visited_state, self.iterations = {}, [], 0
+        self.min_max_stats, self.opening_size = MinMaxStats(), simulations
+        
+        root_val = value_fn(value_model, [target_mol], device)
+        root_uq = uq_dict.get(target_mol, 0.0)
+        self.root = Node([target_mol], root_val, 1.0, cpuct=cpuct, uncertainty=root_uq)
         self.min_max_stats.update(self.root.f)
-        self.opening_size = simulations
-        self.iterations = 0
-
+    
     def select_a_leaf(self):
         current = self.root
         while True:
             current.visited_time += 1
             if not current.is_expanded:
                 return current
-            best_move = current.select_child(self.min_max_stats, self.uncertainty_weight)
-            current = current.children[best_move]
-
-    def select(self):
-        openings = [self.select_a_leaf() for _ in range(self.opening_size)]
-        stats = [opening.f for opening in openings]
-        return openings[np.argmin(stats)]
-
-    def get_state_uncertainty(self, reactant_list):
-        if len(reactant_list) == 0:
-            return 0.0
-        uncertainties = [self.uncertainty_dict.get(mol, 0.0) for mol in reactant_list]
-        return np.max(uncertainties)
-
+            current = current.children[current.select_child(self.min_max_stats, self.uq_weight)]
+    
     def expand(self, node):
         node.is_expanded = True
-        expanded_mol = node.state[0]
-
-        if expanded_mol in self.visited_policy:
-            expanded_policy = self.visited_policy[expanded_mol]
+        mol = node.state[0]
+        
+        if mol in self.visited_policy:
+            policy = self.visited_policy[mol]
         else:
-            expanded_policy = self.expand_fn.run(expanded_mol, topk=50)
+            policy = self.expand_fn.run(mol, topk=50)
             self.iterations += 1
-            self.visited_policy[expanded_mol] = expanded_policy.copy() if expanded_policy else None
-
-        if expanded_policy is not None and len(expanded_policy['scores']) > 0:
-            node.child_illegal = np.array([0] * len(expanded_policy['scores']))
-
-            for i in range(len(expanded_policy['scores'])):
-                reactant = [r for r in expanded_policy['reactants'][i].split('.')
-                           if r not in self.known_mols]
-                reactant = reactant + node.state[1:]
-                reactant = sorted(list(set(reactant)))
-                cost = -np.log(np.clip(expanded_policy['scores'][i], 1e-3, 1.0))
-                template = expanded_policy['template'][i]
-                reaction = expanded_policy['reactants'][i] + '>>' + expanded_mol
-                priors = np.array([1.0 / len(expanded_policy['scores'])] * len(expanded_policy['scores']))
-
-                if len(reactant) == 0:
-                    child = Node([], 0, cost=cost, prior=priors[i], action_mol=expanded_mol,
-                               reaction=reaction, fmove=len(node.children), template=template,
-                               parent=node, cpuct=self.cpuct, uncertainty=0.0)
-                    return True, child
-                else:
-                    h = value_fn(self.value_model, reactant, self.device)
-                    state_uncertainty = self.get_state_uncertainty(reactant)
-                    child = Node(reactant, h, cost=cost, prior=priors[i],
-                               action_mol=expanded_mol, reaction=reaction,
-                               fmove=len(node.children), template=template,
-                               parent=node, cpuct=self.cpuct, uncertainty=state_uncertainty)
-
-                    if '.'.join(reactant) in self.visited_state:
-                        node.child_illegal[child.fmove] = 1000
-        else:
-            if node.parent is not None:
+            self.visited_policy[mol] = policy
+        
+        if not policy or not policy.get('scores'):
+            if node.parent:
                 node.parent.child_illegal[node.fmove] = 1000
+            return False, None
+        
+        node.child_illegal = np.zeros(len(policy['scores']))
+        for i in range(len(policy['scores'])):
+            reactants = [r for r in policy['reactants'][i].split('.') if r not in self.known_mols]
+            reactants = sorted(set(reactants + node.state[1:]))
+            cost = -np.log(np.clip(policy['scores'][i], 1e-3, 1.0))
+            
+            if not reactants:
+                child = Node([], 0, cost=cost, prior=1.0/len(policy['scores']), 
+                           action_mol=mol, reaction=policy['reactants'][i]+'>>'+mol,
+                           fmove=len(node.children), template=policy['template'][i],
+                           parent=node, cpuct=self.cpuct, uncertainty=0.0)
+                return True, child
+            
+            h = value_fn(self.value_model, reactants, self.device)
+            uq = max([self.uq_dict.get(r, 0.0) for r in reactants])
+            Node(reactants, h, cost=cost, prior=1.0/len(policy['scores']),
+                 action_mol=mol, reaction=policy['reactants'][i]+'>>'+mol,
+                 fmove=len(node.children), template=policy['template'][i],
+                 parent=node, cpuct=self.cpuct, uncertainty=uq)
         
         return False, None
-
-    def update(self, node):
-        stat = node.f
-        self.min_max_stats.update(stat)
-        current = node
-        while current is not None:
-            current.f_mean_path.append(stat)
-            current = current.parent
-
-    def search(self, times):
+    
+    def search(self, max_iter):
         success, node = False, None
-        while self.iterations < times and not success:
+        while self.iterations < max_iter and not success:
             if len(self.root.child_illegal) > 0 and np.all(self.root.child_illegal > 0):
                 break
-            
-            expand_node = self.select()
+            expand_node = [self.select_a_leaf() for _ in range(self.opening_size)][
+                np.argmin([n.f for n in [self.select_a_leaf() for _ in range(self.opening_size)]])]
             if '.'.join(expand_node.state) in self.visited_state:
                 if expand_node.parent:
                     expand_node.parent.child_illegal[expand_node.fmove] = 1000
                 continue
-            
             self.visited_state.append('.'.join(expand_node.state))
             success, node = self.expand(expand_node)
-            self.update(expand_node)
-            
-            if self.visited_policy.get(self.target_mol) is None:
-                return False, None, times
-        
+            # Update
+            stat = expand_node.f
+            self.min_max_stats.update(stat)
+            curr = expand_node
+            while curr:
+                curr.f_mean_path.append(stat)
+                curr = curr.parent
         return success, node, self.iterations
-
-    def vis_synthetic_path(self, node):
-        if node is None:
-            return [], []
-        reaction_path, template_path = [], []
-        current = node
-        while current is not None:
-            reaction_path.append(current.reaction)
-            template_path.append(current.template)
-            current = current.parent
-        return reaction_path[::-1], template_path[::-1]
-
-def play_mcts(dataset, mols, known_mols, value_model, expand_fn, device,
-              simulations, cpuct, times, uncertainty_dict, uncertainty_weight=0.5):
-    """Run MCTS with UQ"""
-    print(f"\n[PHASE 3] Running MCTS with UQ...")
-    print(f"  - Molecules: {len(mols)}")
-    print(f"  - Simulations: {simulations}")
-    print(f"  - Uncertainty weight: {uncertainty_weight}")
     
-    routes, templates, successes, depths, counts = [], [], [], [], []
+    def get_path(self, node):
+        if not node:
+            return [], []
+        reactions, templates = [], []
+        while node:
+            reactions.append(node.reaction)
+            templates.append(node.template)
+            node = node.parent
+        return reactions[::-1], templates[::-1]
 
+def run_mcts_uq(dataset, mols, gpu, device, simulations, cpuct, max_iter, uq_weight):
+    """Run MCTS with UQ awareness"""
+    print(f"\n[PHASE 3] Running MCTS with UQ...")
+    print(f"  Molecules: {len(mols)}, UQ weight: {uq_weight}")
+    
+    # Load UQ scores
+    uq_file = f'./uq_outputs/uq_alea{uq_weight:.1f}_epis{1-uq_weight:.1f}.csv'
+    uq_df = pd.read_csv(uq_file)
+    uq_dict = {mol: uq for mol, uq in zip(mols, uq_df['uq_score'].values)}
+    print(f"  Loaded {len(uq_dict)} UQ scores from {uq_file}")
+    
+    # Load models
+    known_mols = prepare_starting_molecules()
+    value_model = prepare_value('./saved_model/value_pc.pt', gpu)
+    expand_fn = prepare_expand('./saved_model/policy_model.ckpt', gpu)
+    
+    # Run MCTS
+    results = {'route': [], 'template': [], 'success': [], 'depth': [], 'counts': []}
     for idx, mol in enumerate(mols):
         try:
             with time_limit(600):
-                player = MCTS_A(mol, known_mols, value_model, expand_fn, device,
-                               simulations, cpuct, uncertainty_dict, uncertainty_weight)
-                success, node, count = player.search(times)
-                route, template = player.vis_synthetic_path(node)
+                mcts = MCTS_UQ(mol, known_mols, value_model, expand_fn, device,
+                             simulations, cpuct, uq_dict, uq_weight)
+                success, node, count = mcts.search(max_iter)
+                route, template = mcts.get_path(node)
         except:
-            success = False
-            route, template = [None], [None]
+            success, route, template, node, count = False, [None], [None], None, -1
         
-        routes.append(route)
-        templates.append(template)
-        successes.append(success)
-        depths.append(node.depth if success else 32)
-        counts.append(count if success else -1)
+        results['route'].append(route)
+        results['template'].append(template)
+        results['success'].append(success)
+        results['depth'].append(node.depth if success else 32)
+        results['counts'].append(count if success else -1)
         
-        if (idx + 1) % 10 == 0:
-            print(f"  Progress: {idx+1}/{len(mols)} ({100*(idx+1)/len(mols):.1f}%)")
-
-    result = {
-        'route': routes,
-        'template': templates,
-        'success': successes,
-        'depth': depths,
-        'counts': counts
-    }
-
-    out_file = f'./test/stat_mcts_uq_{dataset}_{simulations}_{cpuct}_{uncertainty_weight}.pkl'
+        if (idx+1) % 10 == 0:
+            print(f"  {idx+1}/{len(mols)} ({100*(idx+1)/len(mols):.1f}%)")
+    
+    # Save
+    out_file = f'./test/mcts_uq_{dataset}_{simulations}_{cpuct}_{uq_weight}.pkl'
     with open(out_file, 'wb') as f:
-        pickle.dump(result, f, protocol=4)
+        pickle.dump(results, f)
     
-    success_rate = np.mean(successes)
-    avg_depth = np.mean(depths)
-    print(f"\n✅ MCTS Results:")
-    print(f"  - Success rate: {success_rate:.3f}")
-    print(f"  - Avg depth: {avg_depth:.2f}")
-    print(f"  - Saved to: {out_file}")
-    
-    return result
+    sr = np.mean(results['success'])
+    print(f"\n✅ MCTS Results: Success={sr:.3f}, Saved to {out_file}")
+    return results
 
 # ============================================================
-# MAIN PIPELINE
+# MAIN
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Complete MCTS + UQ Pipeline for Lambda Labs')
-    parser.add_argument('--phase', type=str, choices=['1', '2', '3', 'all'], default='all',
-                       help='Which phase to run (1=generate, 2=uq, 3=mcts, all=everything)')
-    parser.add_argument('--dataset', type=str, default='USPTO',
-                       help='Dataset name')
-    parser.add_argument('--gpu', type=int, default=0,
-                       help='GPU id')
-    parser.add_argument('--simulations', type=int, default=100,
-                       help='MCTS simulations')
-    parser.add_argument('--cpuct', type=float, default=4.0,
-                       help='MCTS exploration constant')
-    parser.add_argument('--max_iterations', type=int, default=500,
-                       help='Max iterations')
-    parser.add_argument('--uncertainty_weight', type=float, default=0.5,
-                       help='Uncertainty weight (0-1)')
-    parser.add_argument('--alea_weight', type=float, default=0.5,
-                       help='Aleatoric weight for UQ combination')
-    parser.add_argument('--epis_weight', type=float, default=0.5,
-                       help='Epistemic weight for UQ combination')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--phase', choices=['1', '2', '3', 'all'], default='all')
+    parser.add_argument('--dataset', default='USPTO')
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--simulations', type=int, default=100)
+    parser.add_argument('--cpuct', type=float, default=4.0)
+    parser.add_argument('--max_iterations', type=int, default=500)
+    parser.add_argument('--uq_weight', type=float, default=0.5,
+                       help='UQ weight (also determines which CSV to load: alea=uq_weight, epis=1-uq_weight)')
     args = parser.parse_args()
     
-    # Setup
     os.makedirs('./test', exist_ok=True)
-    os.makedirs('./uq_outputs', exist_ok=True)
-    
     device = f'cuda:{args.gpu}' if args.gpu >= 0 else 'cpu'
-    print(f"\n{'='*60}")
-    print(f"MCTS + UQ Pipeline")
-    print(f"Dataset: {args.dataset}")
-    print(f"Device: {device}")
-    print(f"{'='*60}")
     
     # Load dataset
-    dataset_path = f'./test_dataset/{args.dataset}.pkl'
-    with open(dataset_path, 'rb') as f:
+    with open(f'./test_dataset/{args.dataset}.pkl', 'rb') as f:
         targets = pickle.load(f)
-    print(f"Loaded {len(targets)} target molecules")
+    print(f"Dataset: {args.dataset} ({len(targets)} molecules)")
     
-    # PHASE 1: Generate policy logits & value preds
+    # PHASE 1
     if args.phase in ['1', 'all']:
-        print(f"\n{'='*60}")
-        print("PHASE 1: Generate Policy Logits & Value Predictions")
-        print(f"{'='*60}")
-        
         expand_fn = prepare_expand('./saved_model/policy_model.ckpt', args.gpu)
         value_model = prepare_value('./saved_model/value_pc.pt', args.gpu)
-        
-        save_policy_outputs_tta(
-            expand_fn, targets, device,
-            out_path=f'./test/policy_logits_tta_{args.dataset}.npy',
-            n_aug=20, aggregation="mean", topk=50, save_raw=True
-        )
-        
-        save_value_outputs(
-            value_model, targets, device,
-            out_path=f'./'
+        generate_policy_logits(expand_fn, targets, f'./test/policy_logits_tta_{args.dataset}.npy')
+        generate_value_preds(value_model, targets, device, f'./test/value_preds_{args.dataset}.csv')
+    
+    # PHASE 2
+    if args.phase in ['2', 'all']:
+        generate_uq_csvs(args.dataset)
+    
+    # PHASE 3
+    if args.phase in ['3', 'all']:
+        run_mcts_uq(args.dataset, targets, args.gpu, device, 
+                   args.simulations, args.cpuct, args.max_iterations, args.uq_weight)
+    
+    print(f"\n{'='*60}")
+    print("✅ Pipeline Complete!")
+    print(f"{'='*60}")
+
+if __name__ == '__main__':
+    main()
