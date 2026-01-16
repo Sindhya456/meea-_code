@@ -63,9 +63,13 @@ def value_fn(model, mols, device='cuda'):
 # Prepare models
 # ---------------------------
 def prepare_expand(model_path, device='cuda'):
-    return MLPModel(model_path, './prepare_data/template_rules.dat', device=device)
+   
+    template_path = './saved_model/template_rules.dat'
+    model_path = './saved_model/policy_model.ckpt'
+    return MLPModel(model_path, template_path, device=device)
 
 def prepare_value(model_f, device='cuda'):
+    model_f = './saved_model/value_pc.pt'  # <-- FIXED: actual saved_model location
     model = ValueEnsemble(2048, 128, 0.1).to(device)
     model.load_state_dict(torch.load(model_f, map_location=device))
     model.eval()
