@@ -2,6 +2,7 @@
 # ====================================================
 # Full MCTS + A* + UQ-aware pipeline (GPU-ready)
 # Loops over all datasets in test_dataset
+# Saves both .pkl and .txt summary stats
 # ====================================================
 
 import os, sys, time, pickle
@@ -10,7 +11,7 @@ import heapq
 from tqdm import tqdm
 
 # ---------------------------
-# Your existing MCTS + A* helpers
+# MCTS + A* helpers
 # ---------------------------
 from valueEnsemble import ValueEnsemble
 from policyNet import MLPModel
@@ -63,13 +64,11 @@ def value_fn(model, mols, device='cuda'):
 # Prepare models
 # ---------------------------
 def prepare_expand(model_path, device='cuda'):
-   
+    # Fixed path for template_rules.dat in saved_model
     template_path = './saved_model/template_rules.dat'
-    model_path = './saved_model/policy_model.ckpt'
     return MLPModel(model_path, template_path, device=device)
 
 def prepare_value(model_f, device='cuda'):
-    model_f = './saved_model/value_pc.pt'  # <-- FIXED: actual saved_model location
     model = ValueEnsemble(2048, 128, 0.1).to(device)
     model.load_state_dict(torch.load(model_f, map_location=device))
     model.eval()
@@ -176,11 +175,12 @@ def create_weighted_dataset(mols, uq_scores, method='exponential', scale=5.0):
 # ---------------------------
 if __name__=='__main__':
     os.makedirs('./test',exist_ok=True)
+    os.makedirs('./uq_outputs',exist_ok=True)
     device='cuda' if torch.cuda.is_available() else 'cpu'
 
     # Load models
-    expand_fn = prepare_expand('./policy_model.ckpt', device=device)
-    value_model = prepare_value('./value_pc.pt', device=device)
+    expand_fn = prepare_expand('./saved_model/policy_model.ckpt', device=device)
+    value_model = prepare_value('./saved_model/value_pc.pt', device=device)
 
     # Loop over all datasets in test_dataset
     datasets=os.listdir('./test_dataset')
@@ -197,10 +197,23 @@ if __name__=='__main__':
             success,node,exp_count,elapsed = meea_star(mol, mols, value_model, expand_fn, device)
             depth=node.g if success else 32
             baseline_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
-        # save baseline
-        out_path=f'./test/stat_baseline_{ds_name}.pkl'
-        with open(out_path,'wb') as f: pickle.dump(baseline_results,f)
-        print(f"[INFO] Phase 1 stats saved: {out_path}")
+
+        # save Phase 1: pkl + txt
+        out_path_pkl = f'./test/stat_baseline_{ds_name}.pkl'
+        out_path_txt = f'./test/stat_baseline_{ds_name}.txt'
+        with open(out_path_pkl,'wb') as f: pickle.dump(baseline_results,f)
+        # compute summary stats
+        success_rate = sum(r["success"] for r in baseline_results)/len(baseline_results)
+        avg_depth = sum(r["depth"] for r in baseline_results if r["success"])/max(1,sum(r["success"] for r in baseline_results))
+        avg_exp = sum(r["expansions"] for r in baseline_results)/len(baseline_results)
+        avg_time = sum(r["time"] for r in baseline_results)/len(baseline_results)
+        with open(out_path_txt,'w') as f:
+            f.write(f"Dataset: {ds_name}\n")
+            f.write(f"Success rate: {success_rate:.3f}\n")
+            f.write(f"Avg depth: {avg_depth:.2f}\n")
+            f.write(f"Avg expansions: {avg_exp:.2f}\n")
+            f.write(f"Avg time: {avg_time:.2f}s\n")
+        print(f"[INFO] Phase 1 stats saved: {out_path_pkl} and {out_path_txt}")
 
         # ---------- Phase 2: Generate UQ files ----------
         policy_logits = torch.randn(len(mols),5).to(device)
@@ -208,7 +221,6 @@ if __name__=='__main__':
         generate_uq_files(policy_logits,value_preds, save_dir='./uq_outputs', required_len=len(mols))
 
         # ---------- Phase 2b: Create weighted dataset ----------
-        # Use combined UQ scores from first UQ file
         uq_csv=os.path.join('./uq_outputs','uq_alea0.5_epis0.5.csv')
         uq_scores=pd.read_csv(uq_csv)['uq_score'].to_numpy()
         weighted_mols, weights = create_weighted_dataset(mols, uq_scores)
@@ -220,9 +232,21 @@ if __name__=='__main__':
             depth=node.g if success else 32
             weighted_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
 
-        # save Phase 3
-        out_path=f'./test/stat_meea_{ds_name}.pkl'
-        with open(out_path,'wb') as f: pickle.dump(weighted_results,f)
-        print(f"[INFO] Phase 3 stats saved: {out_path}")
+        # save Phase 3: pkl + txt
+        out_path_pkl = f'./test/stat_meea_{ds_name}.pkl'
+        out_path_txt = f'./test/stat_meea_{ds_name}.txt'
+        with open(out_path_pkl,'wb') as f: pickle.dump(weighted_results,f)
+        # compute summary stats
+        success_rate = sum(r["success"] for r in weighted_results)/len(weighted_results)
+        avg_depth = sum(r["depth"] for r in weighted_results if r["success"])/max(1,sum(r["success"] for r in weighted_results))
+        avg_exp = sum(r["expansions"] for r in weighted_results)/len(weighted_results)
+        avg_time = sum(r["time"] for r in weighted_results)/len(weighted_results)
+        with open(out_path_txt,'w') as f:
+            f.write(f"Dataset: {ds_name}\n")
+            f.write(f"Success rate: {success_rate:.3f}\n")
+            f.write(f"Avg depth: {avg_depth:.2f}\n")
+            f.write(f"Avg expansions: {avg_exp:.2f}\n")
+            f.write(f"Avg time: {avg_time:.2f}s\n")
+        print(f"[INFO] Phase 3 stats saved: {out_path_pkl} and {out_path_txt}")
 
     print("[INFO] Pipeline complete for all datasets!")
