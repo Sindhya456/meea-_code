@@ -1,247 +1,261 @@
-#!/usr/bin/env python3
-# ====================================================
-# Multi-GPU MCTS + A* + UQ-aware pipeline (TXT output)
-# ====================================================
-
-import os, pickle, torch, numpy as np, pandas as pd
+import os
+import pickle
+import time
+import torch
+import numpy as np
+import pandas as pd
+from multiprocessing import Process
 from tqdm import tqdm
 from policyNet import MLPModel
 from valueEnsemble import ValueEnsemble
-
-# ---------------------------
-# GPU setup
-# ---------------------------
-gpus = list(range(torch.cuda.device_count()))
-device_names = [f'cuda:{i}' for i in gpus]
-print(f"[INFO] Detected GPUs: {device_names}")
-
-# ---------------------------
-# Prepare test folder
-# ---------------------------
-test_dir = './test'
-os.makedirs(test_dir, exist_ok=True)
-# Clean previous files
-for f in os.listdir(test_dir):
-    os.remove(os.path.join(test_dir, f))
-print(f"[INFO] Cleaned previous test results in {test_dir}")
-
-# ---------------------------
-# Load models
-# ---------------------------
-policy_model_path = './saved_model/policy_model.ckpt'
-value_model_path = './saved_model/value_pc.pt'
-template_rules_path = './saved_model/template_rules.dat'
-
-expand_models = [MLPModel(policy_model_path, template_rules_path, device=d) for d in device_names]
-value_models = []
-for d in device_names:
-    model = ValueEnsemble(2048, 128, 0.1).to(d)
-    model.load_state_dict(torch.load(value_model_path, map_location=d))
-    model.eval()
-    value_models.append(model)
-
-# ---------------------------
-# Fingerprints
-# ---------------------------
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from contextlib import contextmanager
+import signal
+
+# -----------------------------
+# Helpers
+# -----------------------------
+@contextmanager
+def time_limit(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutError
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
 
 def smiles_to_fp(s, fp_dim=2048):
     mol = Chem.MolFromSmiles(s)
-    if mol is None: return np.zeros(fp_dim, dtype=np.bool_)
     fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=fp_dim)
-    arr = np.zeros(fp.GetNumBits(), dtype=np.bool_)
+    arr = np.zeros(fp.GetNumBits(), dtype=np.float32)
     arr[list(fp.GetOnBits())] = 1
     return arr
 
-def batch_smiles_to_fp(s_list):
-    return np.array([smiles_to_fp(s) for s in s_list])
+def batch_smiles_to_fp(s_list, fp_dim=2048):
+    return np.array([smiles_to_fp(s, fp_dim) for s in s_list], dtype=np.float32)
 
-# ---------------------------
-# Value function
-# ---------------------------
+def prepare_starting_molecules():
+    return set(list(pd.read_csv('./prepare_data/origin_dict.csv')['mol']))
+
+def prepare_value(model_f, gpu):
+    device = torch.device(f'cuda:{gpu}' if gpu >= 0 else 'cpu')
+    model = ValueEnsemble(2048, 128, 0.1).to(device)
+    model.load_state_dict(torch.load(model_f, map_location=device))
+    model.eval()
+    return model
+
+def prepare_expand(model_path, gpu):
+    device = torch.device(f'cuda:{gpu}' if gpu >= 0 else 'cpu')
+    return MLPModel(model_path, './saved_model/template_rules.dat', device=device)
+
 def value_fn(model, mols, device):
-    fps = batch_smiles_to_fp(mols).astype(np.float32)
-    fps_tensor = torch.from_numpy(fps).unsqueeze(0).to(device)
-    mask_tensor = torch.ones(1, fps_tensor.shape[1], dtype=torch.float32).to(device)
+    if len(mols) == 0:
+        return np.zeros(0)
+    fps = batch_smiles_to_fp(mols)
+    fps_tensor = torch.FloatTensor(fps).to(device)
+    mask = torch.ones(fps_tensor.shape[0], dtype=torch.float32, device=device)
     with torch.no_grad():
-        v = model(fps_tensor, mask_tensor).cpu().numpy()
+        v = model(fps_tensor.unsqueeze(0), mask.unsqueeze(0)).cpu().numpy()
     return v.flatten()
 
-# ---------------------------
-# MCTS + A* node
-# ---------------------------
-import heapq
-class AStarNode:
-    def __init__(self, state, g, h, action=None, parent=None):
+# -----------------------------
+# Node for MCTS
+# -----------------------------
+class Node:
+    def __init__(self, state, h, prior, cost=0, action_mol=None, fmove=0, reaction=None, template=None, parent=None, cpuct=1.5):
         self.state = state
-        self.g = g
+        self.cost = cost
         self.h = h
-        self.f = g+h
-        self.action = action
+        self.prior = prior
+        self.visited_time = 0
+        self.is_expanded = False
+        self.template = template
+        self.action_mol = action_mol
+        self.fmove = fmove
+        self.reaction = reaction
         self.parent = parent
-    def __lt__(self, other):
-        return self.f < other.f
+        self.cpuct = cpuct
+        self.children = []
+        self.child_illegal = np.array([])
+        if parent:
+            self.g = parent.g + cost
+            self.depth = parent.depth + 1
+            parent.children.append(self)
+        else:
+            self.g = 0
+            self.depth = 0
+        self.f = self.g + self.h
+        self.f_mean_path = []
 
-def meea_star(target, known_mols, value_model, expand_fn, device, max_steps=500):
-    import numpy as np
-    import time
-    start = time.time()
-    h0 = value_fn(value_model, [target], device)[0]
-    root = AStarNode([target], g=0, h=h0)
-    open_list = [root]
-    visited = set()
-    expansions = 0
-    while open_list and expansions<max_steps:
-        node = heapq.heappop(open_list)
-        expansions +=1
-        if all(m in known_mols for m in node.state):
-            return True, node, expansions, time.time()-start
+    def child_Q(self, min_max_stats):
+        child_Qs = []
+        for c in self.children:
+            if len(c.f_mean_path) == 0:
+                child_Qs.append(0.0)
+            else:
+                child_Qs.append(1 - np.mean(min_max_stats.normalize(c.f_mean_path)))
+        return np.array(child_Qs)
+
+    def child_N(self):
+        return np.array([c.visited_time for c in self.children])
+
+    def child_U(self):
+        N = self.child_N() + 1
+        return self.cpuct * np.sqrt(max(1, self.visited_time)) * self.child_p() / N
+
+    def child_p(self):
+        return np.array([c.prior for c in self.children])
+
+    def select_child(self, min_max_stats):
+        action_score = self.child_Q(min_max_stats) + self.child_U() - self.child_illegal
+        return np.argmax(action_score)
+
+# -----------------------------
+# MinMaxStats for normalization
+# -----------------------------
+class MinMaxStats:
+    def __init__(self):
+        self.maximum = -float('inf')
+        self.minimum = float('inf')
+    def update(self, value):
+        self.maximum = max(self.maximum, value)
+        self.minimum = min(self.minimum, value)
+    def normalize(self, value):
+        if self.maximum > self.minimum:
+            return (np.array(value) - self.minimum) / (self.maximum - self.minimum)
+        return value
+
+# -----------------------------
+# MCTS Player
+# -----------------------------
+class MCTS_A:
+    def __init__(self, target_mol, known_mols, value_model, expand_fn, device, simulations, cpuct):
+        self.target_mol = target_mol
+        self.known_mols = known_mols
+        self.expand_fn = expand_fn
+        self.value_model = value_model
+        self.device = device
+        self.cpuct = cpuct
+        self.visited_policy = {}
+        root_value = value_fn(value_model, [target_mol], device)[0]
+        self.root = Node([target_mol], root_value, prior=1.0, cpuct=cpuct)
+        self.min_max_stats = MinMaxStats()
+        self.min_max_stats.update(self.root.f)
+        self.iterations = 0
+
+    def select_leaf(self):
+        current = self.root
+        while True:
+            current.visited_time += 1
+            if not current.is_expanded:
+                return current
+            best = current.select_child(self.min_max_stats)
+            current = current.children[best]
+
+    def expand(self, node):
+        node.is_expanded = True
         mol = node.state[0]
-        policy_out = expand_fn.run(mol, topk=50)
-        if policy_out is None: continue
-        for i in range(len(policy_out['scores'])):
-            reactants = [r for r in policy_out['reactants'][i].split('.') if r not in known_mols]
-            reactants = sorted(list(set(reactants+node.state[1:])))
-            key = '.'.join(reactants)
-            if key in visited: continue
-            visited.add(key)
-            cost = -np.log(np.clip(policy_out['scores'][i], 1e-3, 1.0))
-            h = value_fn(value_model, reactants, device)[0] if reactants else 0
-            child = AStarNode(reactants, g=node.g+cost, h=h, parent=node, action=(policy_out['template'][i], policy_out['reactants'][i]))
-            heapq.heappush(open_list, child)
-    return False, None, expansions, time.time()-start
+        if mol in self.visited_policy:
+            policy = self.visited_policy[mol]
+        else:
+            policy = self.expand_fn.run(mol, topk=50)
+            self.visited_policy[mol] = policy
+        if policy is None or len(policy['scores']) == 0:
+            return False, None
+        priors = np.array([1.0/len(policy['scores'])]*len(policy['scores']))
+        node.child_illegal = np.zeros(len(policy['scores']))
+        for i in range(len(policy['scores'])):
+            reactant = [r for r in policy['reactants'][i].split('.') if r not in self.known_mols]
+            reactant = sorted(list(set(reactant)))
+            cost = -np.log(np.clip(policy['scores'][i], 1e-3, 1.0))
+            h = 0 if len(reactant)==0 else value_fn(self.value_model, reactant, self.device)
+            Node(reactant, h, priors[i], cost=cost, action_mol=mol, reaction=policy['reactants'][i] + '>>' + mol,
+                 template=policy['template'][i], parent=node, cpuct=self.cpuct)
+        return True, node.children[0]
 
-# ---------------------------
-# UQ functions
-# ---------------------------
-def compute_aleatoric(policy_logits):
-    import torch
-    probs = torch.softmax(policy_logits, dim=1)
-    mean_probs = probs.mean(dim=0)
-    return -(mean_probs*torch.log(mean_probs+1e-12)).sum().item()
+    def update(self, node):
+        stat = node.f
+        self.min_max_stats.update(stat)
+        current = node
+        while current:
+            current.f_mean_path.append(stat)
+            current = current.parent
 
-def compute_epistemic(policy_logits, value_preds):
-    import torch
-    policy_probs = torch.softmax(policy_logits, dim=1)
-    value_probs = torch.sigmoid(value_preds).squeeze(-1)
-    value_probs = torch.stack([value_probs,1-value_probs],dim=1)
-    if policy_probs.shape[1]!=2:
-        top2,_=torch.topk(policy_probs,2,dim=1)
-        policy_probs=top2/top2.sum(1,keepdim=True)
-    M=0.5*(policy_probs+value_probs)
-    jsd=0.5*((policy_probs*(torch.log(policy_probs+1e-12)-torch.log(M+1e-12))).sum(1)+
-             (value_probs*(torch.log(value_probs+1e-12)-torch.log(M+1e-12)).sum(1)))
-    return jsd.cpu().numpy()
+    def search(self, max_iter):
+        success = False
+        while self.iterations < max_iter:
+            node = self.select_leaf()
+            success, _ = self.expand(node)
+            self.update(node)
+            self.iterations += 1
+        return success, node
 
-def compute_combined_uq(alea, epis, w_alea=0.5, w_epis=0.5):
-    return w_alea*np.array(alea).ravel()+w_epis*np.array(epis).ravel()
+# -----------------------------
+# Phase 1: MCTS + A*
+# -----------------------------
+def phase1(dataset, mols, value_model, expand_fn, device, simulations, cpuct, save_dir='./test'):
+    results = []
+    for mol in tqdm(mols, desc=f'Phase1 MCTS ({dataset}) GPU{device}'):
+        player = MCTS_A(mol, known_mols, value_model, expand_fn, device, simulations, cpuct)
+        success, node = player.search(simulations)
+        results.append({
+            'mol': mol,
+            'success': success,
+            'depth': node.depth if node else 0,
+            'route': node.state if node else []
+        })
+    # Save txt & pkl
+    txt_file = os.path.join(save_dir, f'stat_baseline_{dataset}.txt')
+    with open(txt_file, 'w') as f:
+        f.write(f"Dataset: {dataset}\n")
+        f.write(f"Success rate: {np.mean([r['success'] for r in results]):.3f}\n")
+        f.write(f"Avg depth: {np.mean([r['depth'] for r in results]):.2f}\n")
+        f.write(f"Total molecules: {len(mols)}\n")
+    pkl_file = os.path.join(save_dir, f'stat_baseline_{dataset}.pkl')
+    with open(pkl_file, 'wb') as f:
+        pickle.dump(results, f)
+    print(f"[INFO] Phase1 results saved: {txt_file}")
+    return results
 
-# ---------------------------
-# Weighted dataset
-# ---------------------------
-def create_weighted_dataset(mols, uq_scores, method='exponential', scale=5.0):
-    uq_scores = np.array(uq_scores).ravel()
-    if method=='linear':
-        weights = uq_scores/uq_scores.sum()
-    elif method=='exponential':
-        exp_scores = np.exp(scale*uq_scores)
-        weights = exp_scores/exp_scores.sum()
-    else: raise ValueError(f"Unknown weighting method: {method}")
-    indices = np.random.choice(len(mols), size=len(mols), p=weights)
-    weighted_mols = [mols[i] for i in indices]
-    return weighted_mols, weights
+# -----------------------------
+# MAIN
+# -----------------------------
+if __name__ == '__main__':
+    os.makedirs('./test', exist_ok=True)
+    os.makedirs('./uq_outputs', exist_ok=True)
+    # clear previous
+    for f in os.listdir('./test'):
+        os.remove(os.path.join('./test', f))
 
-# ---------------------------
-# Main pipeline
-# ---------------------------
-if __name__=='__main__':
-    import math
+    known_mols = prepare_starting_molecules()
+    datasets = [f.split('.')[0] for f in os.listdir('./test_dataset') if f.endswith('.pkl')]
 
-    # Load datasets
-    dataset_files = os.listdir('./test_dataset')
-    for ds_file in dataset_files:
-        ds_path = os.path.join('./test_dataset', ds_file)
-        with open(ds_path,'rb') as f:
+    model_path = './saved_model/policy_model.ckpt'
+    value_model_path = './saved_model/value_pc.pt'
+
+    devices = list(range(torch.cuda.device_count()))
+    print(f"[INFO] Detected GPUs: {['cuda:'+str(d) for d in devices]}")
+
+    simulations = 100
+    cpuct = 4.0
+
+    value_models = [prepare_value(value_model_path, gpu) for gpu in devices]
+    expand_fns = [prepare_expand(model_path, gpu) for gpu in devices]
+
+    # run datasets
+    for dataset in datasets:
+        with open(f'./test_dataset/{dataset}.pkl', 'rb') as f:
             mols = pickle.load(f)
-        ds_name = os.path.splitext(ds_file)[0]
-        print(f"[INFO] Dataset: {ds_name}, molecules: {len(mols)}")
+        splits = np.array_split(mols, len(devices))
+        procs = []
+        for i, gpu_mols in enumerate(splits):
+            p = Process(target=phase1, args=(dataset, gpu_mols, value_models[i], expand_fns[i], devices[i], simulations, cpuct))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
 
-        # Split molecules across GPUs
-        num_gpus = len(gpus)
-        mol_chunks = np.array_split(mols, num_gpus)
-
-        # Phase 1: Baseline MCTS
-        baseline_results = []
-        for gpu_idx, chunk in enumerate(mol_chunks):
-            value_model = value_models[gpu_idx]
-            expand_fn = expand_models[gpu_idx]
-            device = device_names[gpu_idx]
-            for mol in tqdm(chunk, desc=f"Phase1 MCTS ({ds_name}) GPU{gpu_idx}"):
-                success,node,exp_count,elapsed = meea_star(mol, mols, value_model, expand_fn, device)
-                depth=node.g if success else 32
-                baseline_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
-
-        # Save Phase 1 results as TXT
-        txt_file = os.path.join(test_dir,f'stat_baseline_{ds_name}.txt')
-        with open(txt_file,'w') as f:
-            f.write(f"Dataset: {ds_name}\n")
-            f.write(f"Success rate: {np.mean([r['success'] for r in baseline_results]):.3f}\n")
-            f.write(f"Avg depth: {np.mean([r['depth'] for r in baseline_results]):.2f}\n")
-            f.write(f"Avg expansions: {np.mean([r['expansions'] for r in baseline_results]):.2f}\n")
-            f.write(f"Avg time: {np.mean([r['time'] for r in baseline_results]):.2f}s\n")
-        print(f"[INFO] Phase 1 results saved: {txt_file}")
-
-        # Phase 2: UQ
-        policy_logits = []
-        value_preds = []
-        for gpu_idx, chunk in enumerate(mol_chunks):
-            value_model = value_models[gpu_idx]
-            expand_fn = expand_models[gpu_idx]
-            device = device_names[gpu_idx]
-            for mol in tqdm(chunk, desc=f"Phase2 UQ ({ds_name}) GPU{gpu_idx}"):
-                po = expand_fn.run(mol, topk=50)
-                if po is not None:
-                    logits = torch.tensor(po['scores']).unsqueeze(0)
-                    policy_logits.append(logits)
-                    vpred = value_fn(value_model, [mol], device)
-                    value_preds.append(torch.tensor([[vpred]]))
-        policy_logits = torch.cat(policy_logits, dim=0).to(device_names[0])
-        value_preds = torch.cat(value_preds, dim=0).to(device_names[0])
-
-        # Compute combined UQ
-        alea = [compute_aleatoric(pl.unsqueeze(0)) for pl in policy_logits]
-        epis = compute_epistemic(policy_logits, value_preds)
-        combined_uq = compute_combined_uq(alea, epis, w_alea=0.5, w_epis=0.5)
-
-        # Save UQ scores
-        uq_file = os.path.join('./uq_outputs',f'uq_combined_{ds_name}.txt')
-        os.makedirs('./uq_outputs', exist_ok=True)
-        with open(uq_file,'w') as f:
-            for score in combined_uq:
-                f.write(f"{score:.6f}\n")
-        print(f"[INFO] UQ scores saved: {uq_file}")
-
-        # Phase 3: Weighted MCTS (UQ-aware)
-        weighted_mols, _ = create_weighted_dataset(mols, combined_uq)
-        weighted_results = []
-        for gpu_idx, chunk in enumerate(np.array_split(weighted_mols,num_gpus)):
-            value_model = value_models[gpu_idx]
-            expand_fn = expand_models[gpu_idx]
-            device = device_names[gpu_idx]
-            for mol in tqdm(chunk, desc=f"Phase3 Weighted MCTS ({ds_name}) GPU{gpu_idx}"):
-                success,node,exp_count,elapsed = meea_star(mol, mols, value_model, expand_fn, device)
-                depth=node.g if success else 32
-                weighted_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
-
-        # Save Phase 3
-        txt_file = os.path.join(test_dir,f'stat_meea_{ds_name}.txt')
-        with open(txt_file,'w') as f:
-            f.write(f"Dataset: {ds_name}\n")
-            f.write(f"Success rate: {np.mean([r['success'] for r in weighted_results]):.3f}\n")
-            f.write(f"Avg depth: {np.mean([r['depth'] for r in weighted_results]):.2f}\n")
-            f.write(f"Avg expansions: {np.mean([r['expansions'] for r in weighted_results]):.2f}\n")
-            f.write(f"Avg time: {np.mean([r['time'] for r in weighted_results]):.2f}s\n")
-        print(f"[INFO] Phase 3 results saved: {txt_file}")
-
-    print("[INFO] Pipeline complete for all datasets!")
+    print("[INFO] All datasets completed.")
