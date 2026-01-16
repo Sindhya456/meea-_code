@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ====================================================
-# Full MCTS + A* + UQ-aware pipeline (GPU-ready, multi-GPU)
+# Full MCTS + A* + UQ-aware pipeline (GPU-ready, multi-GPU safe)
 # Loops over all datasets in test_dataset
-# Saves results as TXT for shell access
+# Results saved as TXT for easy shell access
 # ====================================================
 
-import os, time, pickle
+import os, pickle, time
 import torch, numpy as np, pandas as pd
 import heapq
 from tqdm import tqdm
@@ -80,13 +80,14 @@ class AStarNode:
         self.state = state
         self.g = g
         self.h = h
-        self.f = g+h
+        self.f = g + h
         self.action = action
         self.parent = parent
     def __lt__(self, other):
         return self.f < other.f
 
 def meea_star(target, known_mols, value_model, expand_fn, device, max_steps=500):
+    value_model = value_model.to(device)
     start = time.time()
     h0 = value_fn(value_model, [target], device)[0]
     root = AStarNode([target], g=0, h=h0)
@@ -177,11 +178,9 @@ def create_weighted_dataset(mols, uq_scores, method='exponential', scale=5.0):
 if __name__=='__main__':
     os.makedirs('./test', exist_ok=True)
     os.makedirs('./uq_outputs', exist_ok=True)
+    device_names = [f"cuda:{i}" for i in range(torch.cuda.device_count())] or ['cpu']
 
-    device_names = [f'cuda:{i}' for i in range(torch.cuda.device_count())] or ['cpu']
-    print(f"[INFO] Detected GPUs: {device_names}")
-
-    # Load models
+    # Load models once
     expand_fn = prepare_expand('./saved_model/policy_model.ckpt', device=device_names[0])
     value_model = prepare_value('./saved_model/value_pc.pt', device=device_names[0])
 
@@ -195,62 +194,56 @@ if __name__=='__main__':
 
         print(f"[INFO] Dataset: {ds_name}, molecules: {len(mols)}")
 
-        # ---------------------------
-        # Phase 1: Baseline MCTS + A*
-        # ---------------------------
-        chunk_size = (len(mols)+len(device_names)-1)//len(device_names)
-        chunks = [mols[i:i+chunk_size] for i in range(0, len(mols), chunk_size)]
+        # ----------------- Phase 1 -----------------
         baseline_results=[]
-        for i, dev in enumerate(device_names):
-            for mol in chunks[i] if i<len(chunks) else []:
-                success,node,exp_count,elapsed = meea_star(mol, known_mols, value_model, expand_fn, dev)
-                depth = node.g if success else 500
-                baseline_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
+        for i, mol in enumerate(tqdm(mols, desc=f"Phase1 MCTS+A* ({ds_name})")):
+            dev = device_names[i % len(device_names)]
+            success, node, exp_count, elapsed = meea_star(mol, known_mols, value_model, expand_fn, dev)
+            depth = node.g if success else 32
+            baseline_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
 
+        # Save baseline
         out_path = f'./test/stat_baseline_{ds_name}.txt'
         with open(out_path,'w') as f:
             for r in baseline_results:
                 f.write(f"{r['success']}\t{r['depth']:.2f}\t{r['expansions']}\t{r['time']:.4f}\n")
         print(f"[INFO] Phase 1 results saved: {out_path}")
 
-        # ---------------------------
-        # Phase 2: Generate UQ files
-        # ---------------------------
-        # Multi-GPU: split mols
-        chunk_size = (len(mols)+len(device_names)-1)//len(device_names)
-        chunks = [mols[i:i+chunk_size] for i in range(0, len(mols), chunk_size)]
-        policy_logits_list=[]
-        for i, dev in enumerate(device_names):
-            for m in chunks[i] if i<len(chunks) else []:
-                out = expand_fn.run(m)
-                scores = out['scores'][:5] if out and len(out['scores'])>0 else [0]*5
-                scores = torch.tensor(scores, dtype=torch.float32).to(dev)
-                if len(scores)<5: scores = torch.cat([scores, torch.zeros(5-len(scores)).to(dev)])
-                policy_logits_list.append(scores.cpu())  # move back to CPU
+        # ----------------- Phase 2 -----------------
+        # Generate policy logits safely
+        policy_logits_list = []
+        for i, mol in enumerate(tqdm(mols, desc=f"Generating policy logits ({ds_name})")):
+            dev = device_names[i % len(device_names)]
+            expand_fn.model = expand_fn.model.to(dev)
+            out = expand_fn.run(mol)
+            if out is None or len(out['scores']) == 0:
+                scores = torch.zeros(5, device=dev)
+            else:
+                scores = torch.tensor(out['scores'][:5], device=dev)
+                if len(scores) < 5:
+                    scores = torch.cat([scores, torch.zeros(5-len(scores), device=dev)])
+            policy_logits_list.append(scores)
+        policy_logits = torch.stack(policy_logits_list).to(device_names[0])
 
-        policy_logits = torch.stack(policy_logits_list)
-        value_preds = torch.tensor([value_fn(value_model,[m],device_names[0])[0] for m in mols])
+        # Value predictions
+        value_preds = torch.tensor([value_fn(value_model, [m], device_names[0])[0] for m in mols], device=device_names[0])
+
         generate_uq_files(policy_logits, value_preds, save_dir='./uq_outputs', required_len=len(mols))
 
-        # ---------------------------
-        # Phase 2b: Weighted dataset
-        # ---------------------------
+        # ----------------- Phase 2b -----------------
         uq_file = './uq_outputs/uq_alea0.5_epis0.5.txt'
         uq_scores = np.loadtxt(uq_file)
         weighted_mols, weights = create_weighted_dataset(mols, uq_scores)
 
-        # ---------------------------
-        # Phase 3: MCTS + A* on weighted dataset
-        # ---------------------------
+        # ----------------- Phase 3 -----------------
         weighted_results=[]
-        for i, dev in enumerate(device_names):
-            chunk_size = (len(weighted_mols)+len(device_names)-1)//len(device_names)
-            chunks = [weighted_mols[i:i+chunk_size] for i in range(0, len(weighted_mols), chunk_size)]
-            for mol in chunks[i] if i<len(chunks) else []:
-                success,node,exp_count,elapsed = meea_star(mol, known_mols, value_model, expand_fn, dev)
-                depth = node.g if success else 500
-                weighted_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
+        for i, mol in enumerate(tqdm(weighted_mols, desc=f"Phase3 Weighted MCTS+A* ({ds_name})")):
+            dev = device_names[i % len(device_names)]
+            success, node, exp_count, elapsed = meea_star(mol, known_mols, value_model, expand_fn, dev)
+            depth = node.g if success else 32
+            weighted_results.append({"success":success,"depth":depth,"expansions":exp_count,"time":elapsed})
 
+        # Save Phase 3
         out_path = f'./test/stat_meea_{ds_name}.txt'
         with open(out_path,'w') as f:
             for r in weighted_results:
