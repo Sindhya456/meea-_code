@@ -58,6 +58,28 @@ def smiles_to_fp(s, fp_dim=2048):
 def batch_smiles_to_fp(s_list, fp_dim=2048):
     return np.array([smiles_to_fp(s, fp_dim) for s in s_list], dtype=np.float32)
 
+
+# -------------------------
+# Model loaders
+# -------------------------
+def prepare_expand(model_path, gpu=None):
+    device = 'cpu' if gpu is None else gpu
+    one_step = MLPModel(
+        model_path,
+        '/content/template_rules.dat',
+        device=device
+    )
+    return one_step
+
+
+def prepare_value(model_f, gpu=None):
+    device = 'cpu' if gpu is None else gpu
+    model = ValueEnsemble(2048, 128, 0.1).to(device)
+    ckpt = torch.load(model_f, map_location=device)
+    model.load_state_dict(ckpt)
+    model.eval()
+    return model
+
 # ---------------------------
 # Phase 1: TTA Policy + Value Predictions
 # ---------------------------
