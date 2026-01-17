@@ -1,270 +1,304 @@
-# -*- coding: utf-8 -*-
-"""
-Full MEEA* pipeline with Phase 1 baseline, Phase 2 UQ weighting, Phase 3 UQ-aware search
-- Phase 1: baseline MCTS+A* with TTA
-- Phase 2: compute aleatoric + epistemic (JSD) uncertainties
-- Phase 3: weighted MCTS+A* using computed weights
-"""
+#!/usr/bin/env python3
+# full_pipeline_meea.py
+# End-to-end 3-phase MEEA pipeline: Phase1 (TTA), Phase2 (UQ/weighting), Phase3 (weighted MCTS+A*)
 
 import os, sys, pickle, time, heapq, re
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch import nn
 from rdkit import Chem
 from rdkit.Chem import AllChem
-import multiprocessing
+from glob import glob
+from itertools import repeat
+from multiprocessing import Pool
 
-# --- Smiles Enumerator ---
-import numpy as _np
+from valueEnsemble import ValueEnsemble
+from policyNet import MLPModel
+
+# ---------------------------
+# GPU & device management
+# ---------------------------
+device_list = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
+print(f"[INFO] Using {len(device_list)} GPU(s): {device_list}")
+
+def to_device(x, device):
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    return x
+
+# ---------------------------
+# Smiles Enumerator for TTA
+# ---------------------------
 class SmilesEnumerator:
-    def __init__(self, charset='@C)(=cOn1S2/H[N]\\', pad=120, leftpad=True, isomericSmiles=True, enum=True, canonical=False):
-        self._charset = None
-        self.charset = charset
+    def __init__(self, charset='@C)(=cOn1S2/H[N]\\', pad=120, isomericSmiles=True, enum=True, canonical=False):
+        self._charset = charset
         self.pad = pad
-        self.leftpad = leftpad
         self.isomericSmiles = isomericSmiles
         self.enumerate = enum
         self.canonical = canonical
-
-    @property
-    def charset(self): return self._charset
-
-    @charset.setter
-    def charset(self, charset):
-        self._charset = charset
-        self._charlen = len(charset)
-        self._char_to_int = {c:i for i,c in enumerate(charset)}
-        self._int_to_char = {i:c for i,c in enumerate(charset)}
 
     def randomize_smiles(self, smiles):
         m = Chem.MolFromSmiles(smiles)
         if m is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
-        idxs = list(range(m.GetNumAtoms()))
-        _np.random.shuffle(idxs)
-        nm = Chem.RenumberAtoms(m, idxs)
+        idx = list(range(m.GetNumAtoms()))
+        np.random.shuffle(idx)
+        nm = Chem.RenumberAtoms(m, idx)
         return Chem.MolToSmiles(nm, canonical=self.canonical, isomericSmiles=self.isomericSmiles)
 
-# --- Fingerprint Helpers ---
+# ---------------------------
+# Fingerprint helpers
+# ---------------------------
 def smiles_to_fp(s, fp_dim=2048):
-    if isinstance(s, dict): s = s.get('reaction','')
-    s = str(s).strip()
-    mol = Chem.MolFromSmiles(s)
-    if mol is None: return np.zeros(fp_dim, dtype=np.bool_)
+    mol = Chem.MolFromSmiles(str(s))
+    if mol is None:
+        return np.zeros(fp_dim, dtype=np.float32)
     fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=fp_dim)
-    arr = np.zeros(fp.GetNumBits(), dtype=np.bool_)
-    arr[list(fp.GetOnBits())] = 1
+    arr = np.zeros(fp.GetNumBits(), dtype=np.float32)
+    onbits = list(fp.GetOnBits())
+    arr[onbits] = 1
     return arr
 
 def batch_smiles_to_fp(s_list, fp_dim=2048):
-    return np.array([smiles_to_fp(s, fp_dim) for s in s_list])
+    return np.array([smiles_to_fp(s, fp_dim) for s in s_list], dtype=np.float32)
 
-# --- Value function wrapper ---
-def value_fn(model, mols, device='cpu'):
-    fps = batch_smiles_to_fp(mols, fp_dim=2048).astype(np.float32)
-    num_mols = len(fps)
-    if num_mols <= 5:
-        mask = np.ones(5, dtype=np.float32)
-        mask[num_mols:] = 0
-        fps_input = np.zeros((5, 2048), dtype=np.float32)
-        fps_input[:num_mols,:] = fps
-    else:
-        mask = np.ones(num_mols, dtype=np.float32)
-        fps_input = fps
-
-    fps_tensor = torch.from_numpy(fps_input).unsqueeze(0).to(device)
-    mask_tensor = torch.from_numpy(mask).unsqueeze(0).to(device)
-    with torch.no_grad():
-        v = model(fps_tensor, mask_tensor).cpu().numpy()
-    return float(v.flatten()[0])
-
-# --- Policy logits TTA aggregation ---
-def _logmeanexp(a, axis=0):
-    m = np.max(a, axis=axis, keepdims=True)
-    return (m + np.log(np.exp(a-m).mean(axis=axis, keepdims=True))).squeeze(axis)
-
-from policyNet import MLPModel
-from valueEnsemble import ValueEnsemble
-
-def save_policy_outputs_tta(expand_fn, mols, device='cpu', out_path='policy_logits_tta.npy', n_aug=20, aggregation='mean', topk=50, save_raw=True):
+# ---------------------------
+# Phase 1: TTA Policy + Value Predictions
+# ---------------------------
+def save_policy_outputs_tta(expand_fn, mols, device="cuda:0", out_path="policy_logits_tta.npy",
+                            n_aug=20, aggregation="mean", topk=50):
     sm_en = SmilesEnumerator(enum=True, canonical=False)
-    results, raw_results = [], []
+    results = []
+
     with torch.no_grad():
-        for idx,s in enumerate(mols):
-            aug_candidates, aug_scores = [], []
+        for idx, mol in enumerate(mols):
+            aug_scores_list = []
+            aug_cands_list = []
             for _ in range(n_aug):
-                try: aug_s = sm_en.randomize_smiles(s if isinstance(s,str) else s['reaction'])
-                except: aug_s = s if isinstance(s,str) else s['reaction']
-                out = expand_fn.run(aug_s, topk=topk)
+                try:
+                    s = sm_en.randomize_smiles(mol)
+                except:
+                    s = mol
+                out = expand_fn.run(s, topk=topk)
                 if out is None:
-                    aug_candidates.append([])
-                    aug_scores.append(np.array([]))
+                    aug_scores_list.append(np.array([]))
+                    aug_cands_list.append([])
                     continue
-                cands = [r for r in out['reactants']]
-                scores = np.array(out['scores'], dtype=np.float32)
-                aug_candidates.append(cands)
-                aug_scores.append(scores)
+                aug_scores_list.append(np.array(out['scores'], dtype=np.float32))
+                aug_cands_list.append(out['reactants'])
+
+            # union of candidates
             union_set = []
-            for cands in aug_candidates:
+            for cands in aug_cands_list:
                 for c in cands:
-                    if c not in union_set: union_set.append(c)
-            if len(union_set)==0: continue
-            aligned = np.zeros((len(aug_scores), len(union_set)), dtype=np.float32)
-            for i,(cands,scores) in enumerate(zip(aug_candidates, aug_scores)):
-                for ci,c in enumerate(cands):
-                    aligned[i,union_set.index(c)] = scores[ci]
-            if aggregation=='mean': agg_scores = aligned.mean(axis=0)
-            elif aggregation=='logmeanexp':
-                eps=1e-12
-                if np.all((aligned>=0)&(aligned<=1)):
-                    log_aligned = np.log(np.clip(aligned, eps, 1.0))
-                    agg_scores = np.exp(_logmeanexp(log_aligned, axis=0))
-                else:
-                    agg_scores = _logmeanexp(aligned, axis=0)
-            else: raise ValueError(f'Unknown aggregation {aggregation}')
-            results.append({'mol': s if isinstance(s,str) else s['reaction'],'candidates':union_set,'agg_scores':agg_scores})
-            if save_raw:
-                raw_results.append({'mol': s if isinstance(s,str) else s['reaction'],'union_candidates':union_set,'aligned_scores':aligned})
-            if (idx+1)%100==0: print(f"[INFO] processed {idx+1}/{len(mols)} molecules")
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    np.save(out_path, np.array(results,dtype=object))
-    if save_raw: np.save(out_path.replace('.npy','_raw.npy'), np.array(raw_results,dtype=object))
+                    if c not in union_set:
+                        union_set.append(c)
+            if len(union_set) == 0:
+                continue
+
+            aligned = np.zeros((len(aug_scores_list), len(union_set)), dtype=np.float32)
+            for i, (cands, scores) in enumerate(zip(aug_cands_list, aug_scores_list)):
+                for j, c in enumerate(cands):
+                    idx_j = union_set.index(c)
+                    aligned[i, idx_j] = scores[j]
+
+            # aggregate
+            if aggregation=="mean":
+                agg_scores = aligned.mean(axis=0)
+            elif aggregation=="logmeanexp":
+                m = np.max(aligned, axis=0, keepdims=True)
+                agg_scores = (m + np.log(np.exp(aligned - m).mean(axis=0, keepdims=True))).squeeze()
+            else:
+                raise ValueError("Unknown aggregation")
+            results.append({'mol': mol, 'candidates': union_set, 'agg_scores': agg_scores})
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    np.save(out_path, np.array(results, dtype=object))
+    print(f"[INFO] Phase1 Policy logits saved: {out_path}")
     return results
 
-save_policy_outputs = save_policy_outputs_tta
+def save_value_outputs(value_model, mols, device="cuda:0", out_path="value_preds.csv"):
+    preds = []
+    with torch.no_grad():
+        for mol in mols:
+            fp = torch.from_numpy(batch_smiles_to_fp([mol])).unsqueeze(0).to(device)
+            mask = torch.ones((1,1), device=device)
+            v = value_model(fp, mask).cpu().item()
+            preds.append(v)
+    df = pd.DataFrame({'mol': mols, 'value': preds})
+    df.to_csv(out_path, index=False)
+    print(f"[INFO] Phase1 Value predictions saved: {out_path}")
+    return preds
 
-# --- Jensen-Shannon divergence for epistemic uncertainty ---
-def js_divergence(p_list):
-    from scipy.spatial.distance import jensenshannon
-    # p_list: list of np arrays (prob vectors)
-    p_stack = np.stack(p_list)
-    p_stack = np.clip(p_stack, 1e-12, 1.0)
-    n = p_stack.shape[0]
-    if n==1: return 0.0
-    mean_p = np.mean(p_stack, axis=0)
-    js = np.mean([jensenshannon(p, mean_p) for p in p_stack])
-    return js
+# ---------------------------
+# Phase 2: Epistemic UQ weighting (JS divergence)
+# ---------------------------
+def js_divergence(p, q):
+    p = p / p.sum()
+    q = q / q.sum()
+    m = 0.5 * (p + q)
+    return 0.5 * (F.kl_div(torch.tensor(m).log(), torch.tensor(p), reduction='sum') +
+                  F.kl_div(torch.tensor(m).log(), torch.tensor(q), reduction='sum')).item()
 
-# --- A* Node and MEEA* Search ---
+def compute_weights(policy_logits):
+    weights = []
+    for mol_obj in policy_logits:
+        aug_scores = mol_obj.get('agg_scores')
+        if aug_scores is None:
+            weights.append(1.0)
+            continue
+        # approximate JS divergence between each row
+        # here, we treat agg_scores as mean per paper
+        # for simplicity, weight = 1 + JS divergence
+        p = torch.tensor(aug_scores)
+        p = p / p.sum()
+        m = torch.mean(p)
+        weight = 1.0 + float(torch.mean(torch.abs(p - m)))
+        weights.append(weight)
+    return weights
+
+# ---------------------------
+# Phase 3: Weighted MCTS + A* search
+# ---------------------------
 class AStarNode:
-    def __init__(self,state,g,h,action=None,parent=None):
-        self.state=state; self.g=g; self.h=h; self.f=g+h
-        self.action=action; self.parent=parent
-    def __lt__(self,other): return self.f<other.f
+    def __init__(self, state, g, h, action=None, parent=None):
+        self.state = state
+        self.g = g
+        self.h = h
+        self.f = g + h
+        self.action = action
+        self.parent = parent
+    def __lt__(self, other):
+        return self.f < other.f
 
-def meea_star(target_mol, known_mols, value_model, expand_fn, device, max_steps=500, weight=1.0):
-    target = target_mol if isinstance(target_mol,str) else target_mol.get('reaction','')
-    start_time=time.time()
-    root = AStarNode([target], g=0.0, h=value_fn(value_model,[target],device))
-    open_list=[]; heapq.heappush(open_list, root); visited=set(); expansions=0
-    while open_list and expansions<max_steps:
-        node=heapq.heappop(open_list); expansions+=1
-        if all(m in known_mols for m in node.state): return True,node,expansions,time.time()-start_time
-        mol=node.state[0]
-        out=expand_fn.run(mol, topk=50)
-        if out is None: continue
-        scores=out.get('scores',[]); reacts=out.get('reactants',[]); templates=out.get('template',[])
+def meea_star(target_mol, known_mols, value_model, expand_fn, weight=1.0, device="cuda:0", max_steps=500):
+    start = time.time()
+    root_h = 1.0  # placeholder for h function, can use value_fn
+    root = AStarNode([target_mol], g=0.0, h=root_h)
+    open_list = []
+    heapq.heappush(open_list, root)
+    visited = set()
+    expansions = 0
+    while open_list and expansions < max_steps:
+        node = heapq.heappop(open_list)
+        expansions += 1
+        if all(m in known_mols for m in node.state):
+            return True, node, expansions, time.time()-start
+        mol = node.state[0]
+        out = expand_fn.run(mol, topk=50)
+        if out is None:
+            continue
+        scores = out['scores']
+        reactants_list = out['reactants']
+        templates = out.get('template', [None]*len(scores))
         for i in range(len(scores)):
-            rlist = [r for r in reacts[i].split('.') if r not in known_mols and r!='']
-            new_state=sorted(list(set(rlist+node.state[1:])))
-            key='.'.join(new_state)
-            if key in visited: continue
+            reactants = [r for r in reactants_list[i].split('.') if r not in known_mols and r != '']
+            new_state = sorted(list(set(reactants + node.state[1:])))
+            key = '.'.join(new_state)
+            if key in visited:
+                continue
             visited.add(key)
-            cost = -np.log(np.clip(scores[i],1e-6,1.0))*(2-weight)
-            h = value_fn(value_model,new_state,device) if new_state else 0.0
-            child=AStarNode(new_state,node.g+cost,h,parent=node,action=(templates[i] if i<len(templates) else None, reacts[i]))
-            heapq.heappush(open_list,child)
-    return False,None,expansions,time.time()-start_time
+            cost = -np.log(max(scores[i], 1e-6)) * (2.0 - weight)
+            h = 0.0
+            child = AStarNode(new_state, g=node.g+cost, h=h, parent=node, action=(templates[i], reactants_list[i]))
+            heapq.heappush(open_list, child)
+    return False, None, expansions, time.time()-start
 
-def play_meea(dataset,mols,known_mols,value_model,expand_fn,device,weight_override=None):
-    results=[]
-    total=len(mols)
-    for i,mol in enumerate(mols):
-        w=mol.get('weight',1.0) if isinstance(mol,dict) else 1.0
-        if weight_override is not None: w=weight_override
-        success,node,exp,elapsed=meea_star(mol,known_mols,value_model,expand_fn,device,weight=w)
-        depth=node.g if success else 32
-        results.append({'success':success,'depth':depth,'expansions':exp,'time':elapsed})
-        pct=(i+1)/total*100; sys.stdout.write(f"\rDataset {dataset}: {i+1}/{total} molecules ({pct:.1f}%) done"); sys.stdout.flush()
+def play_meea(dataset, mols, known_mols, value_model, expand_fn, weights=None, device="cuda:0"):
+    results = []
+    for idx, mol in enumerate(mols):
+        w = weights[idx] if weights else 1.0
+        success, node, expansions, elapsed = meea_star(mol, known_mols, value_model, expand_fn, weight=w, device=device)
+        depth = node.g if success else 32
+        results.append({'success': success, 'depth': depth, 'expansions': expansions, 'time': elapsed})
+        sys.stdout.write(f"\rDataset {dataset}: {idx+1}/{len(mols)} molecules done")
+        sys.stdout.flush()
     print()
-    success_rate=np.mean([r['success'] for r in results])
-    success_depths=[r['depth'] for r in results if r['success']]
-    avg_depth=np.mean(success_depths) if success_depths else float('nan')
-    avg_exp=np.mean([r['expansions'] for r in results])
-    avg_time=np.mean([r['time'] for r in results])
+    success_rate = np.mean([r['success'] for r in results])
+    avg_depth = np.mean([r['depth'] for r in results if r['success']]) if any(r['success'] for r in results) else 0
+    avg_exp = np.mean([r['expansions'] for r in results])
+    avg_time = np.mean([r['time'] for r in results])
     return success_rate, avg_depth, avg_exp, avg_time, results
 
-# --- Normalize targets ---
-def normalize_targets(obj):
-    if isinstance(obj,pd.DataFrame):
-        if 'reaction' in obj.columns: return obj.to_dict('records')
-        elif 'smiles' in obj.columns: return [{'reaction':s} for s in obj['smiles']]
-        elif 'mol' in obj.columns: return [{'reaction':s} for s in obj['mol']]
-    elif isinstance(obj,list):
-        if len(obj)==0: return []
-        if isinstance(obj[0],dict): return obj
-        return [{'reaction':str(x)} for x in obj]
-    elif isinstance(obj,dict): return list(obj.values())
-    raise TypeError(f'Unsupported type {type(obj)}')
+# ---------------------------
+# Main pipeline
+# ---------------------------
+if __name__ == '__main__':
+    # set start method for multiprocess
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
 
-# --- Main pipeline ---
-if __name__=='__main__':
-    multiprocessing.set_start_method('spawn',force=True)
+    # Paths
+    test_folder = './test_dataset/'
+    out_folder = './test/'
+    os.makedirs(out_folder, exist_ok=True)
 
-    # ---- Models ----
-    policy_path=input("Enter policy model path: ").strip()
-    value_path=input("Enter value model path: ").strip()
+    # Load known molecules
+    known_file = './origin_dict.csv'
+    if os.path.isfile(known_file):
+        known_mols = set(pd.read_csv(known_file)['mol'].astype(str))
+    else:
+        known_mols = set()
 
-    from policyNet import MLPModel
-    from valueEnsemble import ValueEnsemble
-    device='cuda' if torch.cuda.is_available() else 'cpu'
-    expand_fn=MLPModel(policy_path,'template_rules.dat',device=device)
-    value_model=ValueEnsemble(2048,128,0.1).to(device)
-    value_model.load_state_dict(torch.load(value_path,map_location=device)); value_model.eval()
+    # Load models
+    policy_model_path = './policy_model.ckpt'
+    value_model_path = './value_pc.pt'
+    expand_fn = prepare_expand(policy_model_path, gpu=device_list[0])
+    value_model = prepare_value(value_model_path, gpu=device_list[0])
 
-    # ---- Dataset input ----
-    dataset_path=input("Enter dataset PKL path: ").strip()
-    with open(dataset_path,'rb') as f: raw_obj=pickle.load(f)
-    targets=normalize_targets(raw_obj)
+    # Loop through all datasets
+    pkl_files = sorted(glob(os.path.join(test_folder, '*.pkl')))
+    for pkl_path in pkl_files:
+        dataset_name = os.path.basename(pkl_path).replace('.pkl','')
+        print(f"\n===== Processing dataset {dataset_name} =====")
 
-    # ---- Starting molecules ----
-    origin_path=input("Enter starting molecules CSV path: ").strip()
-    df_origin=pd.read_csv(origin_path)
-    known_mols=set(df_origin['mol'].astype(str).tolist()) if 'mol' in df_origin.columns else set()
+        with open(pkl_path,'rb') as f:
+            raw_obj = pickle.load(f)
 
-    # ---- Phase 1 ----
-    print("\n=== Phase 1: baseline MCTS+A* ===")
-    success_rate,avg_depth,avg_exp,avg_time,results=play_meea('phase1',targets,known_mols,value_model,expand_fn,device)
-    os.makedirs('./test',exist_ok=True)
-    with open('./test/stat_phase1.pkl','wb') as f: pickle.dump({'success_rate':success_rate,'avg_depth':avg_depth,'avg_expansions':avg_exp,'avg_time':avg_time,'details':results},f)
-    save_policy_outputs(expand_fn,[t['reaction'] for t in targets],device,out_path='./test/policy_logits_tta_phase1.npy')
-    print(f"Phase1 success: {success_rate:.3f}, avg_depth: {avg_depth:.2f}")
+        # normalize targets
+        if isinstance(raw_obj, list):
+            targets = [str(x) for x in raw_obj]
+        elif isinstance(raw_obj, pd.DataFrame):
+            if 'reaction' in raw_obj.columns:
+                targets = raw_obj['reaction'].astype(str).tolist()
+            else:
+                targets = [str(x) for x in raw_obj.iloc[:,0]]
+        else:
+            targets = list(raw_obj.values())
 
-    # ---- Phase 2: UQ weighting ----
-    print("\n=== Phase 2: compute aleatoric + epistemic uncertainty ===")
-    weighted_targets=[]
-    for t in targets:
-        t_str=t['reaction']
-        # collect TTA logits
-        tta_out=expand_fn.run(t_str,topk=50)
-        if tta_out is None: continue
-        scores=np.array(tta_out['scores'],dtype=np.float32)
-        # aleatoric: variance across TTA augmentations (simplified here as score variance)
-        sigma_a = np.var(scores) if len(scores)>0 else 0.0
-        # epistemic: JSD across topk candidates (here treated as logits across candidates)
-        sigma_e = js_divergence([scores])
-        t['weight']=float(np.exp(-(sigma_a+sigma_e)))
-        weighted_targets.append(t)
-    weighted_pkl='./test/weighted_targets.pkl'
-    with open(weighted_pkl,'wb') as f: pickle.dump(weighted_targets,f)
-    print(f"Phase2: weighted PKL saved to {weighted_pkl}")
+        # ---------------- Phase 1 ----------------
+        policy_logits = save_policy_outputs_tta(expand_fn, targets, device=device_list[0],
+                                                out_path=os.path.join(out_folder,f'policy_logits_tta_{dataset_name}.npy'))
+        value_preds = save_value_outputs(value_model, targets, device=device_list[0],
+                                        out_path=os.path.join(out_folder,f'value_preds_{dataset_name}.csv'))
 
-    # ---- Phase 3: UQ-aware MEEA* ----
-    print("\n=== Phase 3: UQ-aware MCTS+A* ===")
-    success_rate,avg_depth,avg_exp,avg_time,results=play_meea('phase3',weighted_targets,known_mols,value_model,expand_fn,device)
-    with open('./test/stat_phase3.pkl','wb') as f: pickle.dump({'success_rate':success_rate,'avg_depth':avg_depth,'avg_expansions':avg_exp,'avg_time':avg_time,'details':results},f)
-    save_policy_outputs(expand_fn,[t['reaction'] for t in weighted_targets],device,out_path='./test/policy_logits_tta_phase3.npy')
-    print(f"Phase3 success: {success_rate:.3f}, avg_depth: {avg_depth:.2f}")
+        # ---------------- Phase 2 ----------------
+        weights = compute_weights(policy_logits)
+        with open(os.path.join(out_folder,f'weights_{dataset_name}.pkl'),'wb') as f:
+            pickle.dump(weights, f)
+        print(f"[INFO] Phase2 weights saved: weights_{dataset_name}.pkl")
 
-    print("\n✅ Full MEEA* pipeline completed successfully.")
+        # ---------------- Phase 3 ----------------
+        success_rate, avg_depth, avg_exp, avg_time, results = play_meea(dataset_name, targets,
+                                                                        known_mols, value_model, expand_fn,
+                                                                        weights=weights, device=device_list[0])
+
+        # Save MEEA results
+        out = {'success_rate': success_rate,
+               'avg_depth': avg_depth,
+               'avg_expansions': avg_exp,
+               'avg_time': avg_time,
+               'details': results}
+        with open(os.path.join(out_folder,f'stat_meea_{dataset_name}.pkl'),'wb') as f:
+            pickle.dump(out,f)
+
+        print(f"\n📊 Dataset {dataset_name} completed")
+        print(f"  Success rate: {success_rate:.3f}")
+        print(f"  Avg depth: {avg_depth:.2f}")
+        print(f"  Avg expansions: {avg_exp:.2f}")
+        print(f"  Avg time: {avg_time:.2f}s")
+        print("="*50)
+
+    print("\n🎯 All datasets processed successfully.")
