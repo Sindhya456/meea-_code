@@ -2,7 +2,7 @@
 # full_pipeline_meea.py
 # End-to-end 3-phase MEEA pipeline: Phase1 (TTA), Phase2 (UQ/weighting), Phase3 (weighted MCTS+A*)
 
-import os, sys, pickle, time, heapq, re
+import os, sys, pickle, time, heapq
 import numpy as np
 import pandas as pd
 import torch
@@ -11,8 +11,7 @@ from torch import nn
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from glob import glob
-from itertools import repeat
-from multiprocessing import Pool
+import multiprocessing
 
 from valueEnsemble import ValueEnsemble
 from policyNet import MLPModel
@@ -22,11 +21,6 @@ from policyNet import MLPModel
 # ---------------------------
 device_list = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
 print(f"[INFO] Using {len(device_list)} GPU(s): {device_list}")
-
-def to_device(x, device):
-    if isinstance(x, torch.Tensor):
-        return x.to(device)
-    return x
 
 # ---------------------------
 # Smiles Enumerator for TTA
@@ -114,6 +108,9 @@ def save_policy_outputs_tta(expand_fn, mols, device="cuda:0", out_path="policy_l
                 raise ValueError("Unknown aggregation")
             results.append({'mol': mol, 'candidates': union_set, 'agg_scores': agg_scores})
 
+            if (idx + 1) % 100 == 0:
+                print(f"[INFO] Phase1 processed {idx+1}/{len(mols)} molecules")
+
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     np.save(out_path, np.array(results, dtype=object))
     print(f"[INFO] Phase1 Policy logits saved: {out_path}")
@@ -122,11 +119,13 @@ def save_policy_outputs_tta(expand_fn, mols, device="cuda:0", out_path="policy_l
 def save_value_outputs(value_model, mols, device="cuda:0", out_path="value_preds.csv"):
     preds = []
     with torch.no_grad():
-        for mol in mols:
+        for idx, mol in enumerate(mols):
             fp = torch.from_numpy(batch_smiles_to_fp([mol])).unsqueeze(0).to(device)
             mask = torch.ones((1,1), device=device)
             v = value_model(fp, mask).cpu().item()
             preds.append(v)
+            if (idx + 1) % 100 == 0:
+                print(f"[INFO] Phase1 Value processed {idx+1}/{len(mols)} molecules")
     df = pd.DataFrame({'mol': mols, 'value': preds})
     df.to_csv(out_path, index=False)
     print(f"[INFO] Phase1 Value predictions saved: {out_path}")
@@ -149,9 +148,6 @@ def compute_weights(policy_logits):
         if aug_scores is None:
             weights.append(1.0)
             continue
-        # approximate JS divergence between each row
-        # here, we treat agg_scores as mean per paper
-        # for simplicity, weight = 1 + JS divergence
         p = torch.tensor(aug_scores)
         p = p / p.sum()
         m = torch.mean(p)
@@ -175,7 +171,7 @@ class AStarNode:
 
 def meea_star(target_mol, known_mols, value_model, expand_fn, weight=1.0, device="cuda:0", max_steps=500):
     start = time.time()
-    root_h = 1.0  # placeholder for h function, can use value_fn
+    root_h = 1.0
     root = AStarNode([target_mol], g=0.0, h=root_h)
     open_list = []
     heapq.heappush(open_list, root)
@@ -226,29 +222,23 @@ def play_meea(dataset, mols, known_mols, value_model, expand_fn, weights=None, d
 # Main pipeline
 # ---------------------------
 if __name__ == '__main__':
-    # set start method for multiprocess
-    import multiprocessing
     multiprocessing.set_start_method('spawn', force=True)
 
-    # Paths
     test_folder = './test_dataset/'
     out_folder = './test/'
     os.makedirs(out_folder, exist_ok=True)
 
-    # Load known molecules
     known_file = './origin_dict.csv'
     if os.path.isfile(known_file):
         known_mols = set(pd.read_csv(known_file)['mol'].astype(str))
     else:
         known_mols = set()
 
-    # Load models
     policy_model_path = './policy_model.ckpt'
     value_model_path = './value_pc.pt'
     expand_fn = prepare_expand(policy_model_path, gpu=device_list[0])
     value_model = prepare_value(value_model_path, gpu=device_list[0])
 
-    # Loop through all datasets
     pkl_files = sorted(glob(os.path.join(test_folder, '*.pkl')))
     for pkl_path in pkl_files:
         dataset_name = os.path.basename(pkl_path).replace('.pkl','')
@@ -257,7 +247,6 @@ if __name__ == '__main__':
         with open(pkl_path,'rb') as f:
             raw_obj = pickle.load(f)
 
-        # normalize targets
         if isinstance(raw_obj, list):
             targets = [str(x) for x in raw_obj]
         elif isinstance(raw_obj, pd.DataFrame):
@@ -268,24 +257,23 @@ if __name__ == '__main__':
         else:
             targets = list(raw_obj.values())
 
-        # ---------------- Phase 1 ----------------
+        # Phase 1
         policy_logits = save_policy_outputs_tta(expand_fn, targets, device=device_list[0],
                                                 out_path=os.path.join(out_folder,f'policy_logits_tta_{dataset_name}.npy'))
         value_preds = save_value_outputs(value_model, targets, device=device_list[0],
                                         out_path=os.path.join(out_folder,f'value_preds_{dataset_name}.csv'))
 
-        # ---------------- Phase 2 ----------------
+        # Phase 2
         weights = compute_weights(policy_logits)
         with open(os.path.join(out_folder,f'weights_{dataset_name}.pkl'),'wb') as f:
             pickle.dump(weights, f)
         print(f"[INFO] Phase2 weights saved: weights_{dataset_name}.pkl")
 
-        # ---------------- Phase 3 ----------------
+        # Phase 3
         success_rate, avg_depth, avg_exp, avg_time, results = play_meea(dataset_name, targets,
                                                                         known_mols, value_model, expand_fn,
                                                                         weights=weights, device=device_list[0])
 
-        # Save MEEA results
         out = {'success_rate': success_rate,
                'avg_depth': avg_depth,
                'avg_expansions': avg_exp,
