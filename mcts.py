@@ -261,7 +261,7 @@ if __name__ == '__main__':
         known_mols = set()
 
     policy_model_path = '/home/ubuntu/meea-_code/saved_model/policy_model.ckpt'
-'
+
     value_model_path = '/home/ubuntu/meea-_code/saved_model/
 /value_pc.pt'
     expand_fn = prepare_expand(policy_model_path, gpu=device_list[0])
