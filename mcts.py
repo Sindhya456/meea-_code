@@ -231,7 +231,11 @@ def meea_star(target_mol, known_mols, value_model, expand_fn, weight=1.0, device
 def play_meea(dataset, mols, known_mols, value_model, expand_fn, weights=None, device="cuda:0"):
     results = []
     for idx, mol in enumerate(mols):
-        w = weights[idx] if weights else 1.0
+        if weights is None or idx >= len(weights):
+                w = 1.0
+        else:
+                w = weights[idx]
+
         success, node, expansions, elapsed = meea_star(mol, known_mols, value_model, expand_fn, weight=w, device=device)
         depth = node.g if success else 32
         results.append({'success': success, 'depth': depth, 'expansions': expansions, 'time': elapsed})
