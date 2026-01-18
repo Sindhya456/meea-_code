@@ -62,14 +62,18 @@ def batch_smiles_to_fp(s_list, fp_dim=2048):
 # -------------------------
 # Model loaders
 # -------------------------
+import os
+
 def prepare_expand(model_path, gpu=None):
     device = 'cpu' if gpu is None else gpu
+    template_path = os.path.expanduser('~/content/template_rules.dat')
     one_step = MLPModel(
         model_path,
-        '/content/template_rules.dat',
+        template_path,
         device=device
     )
     return one_step
+
 
 
 def prepare_value(model_f, gpu=None):
